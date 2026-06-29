@@ -1,0 +1,13 @@
+# local tooling / agents
+.claude-flow/
+.claude/
+
+# dependencies
+node_modules/
+
+# os
+.DS_Store
+
+# logs
+*.log
+npm-debug.log*
