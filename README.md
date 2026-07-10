@@ -71,6 +71,10 @@ The dashboard stays open the whole time.
 - **Local apps** — detected tools (like claude-mem, only if installed), any
   other live localhost server, and apps you pin yourself all show up
   alongside your projects.
+- **Usage credits** — press `u` for today's and all-time Claude Code token
+  and estimated-cost burn, read straight from Claude's own local logs. A
+  compact `⛽` glance sits in the footer. Local-only: nothing is uploaded and
+  no API key is needed.
 - **Project stats** — lines of code, disk and `node_modules` size, language
   breakdown, and git status, without leaving the dashboard.
 - **Scriptable output** — `pm --list` and `pm --json` for scripts and other
@@ -119,6 +123,30 @@ executable by name or absolute path. Valid entries are saved to
 `~/.foldview.json` under `aiClis` (deduplicated by resolved path) and appear
 in the picker from then on, alongside your other configuration.
 
+## Usage credits
+
+Vibe coding runs on tokens, and it's easy to lose track of how many you've
+burned. Foldview reads Claude Code's own local session logs
+(`~/.claude/projects/**/*.jsonl`) and totals your token usage and estimated
+cost — the same idea as `ccusage`, built right into the dashboard.
+
+Press `u` for the full report — today, all-time, a per-model breakdown, and
+the last few days — or glance at the footer, where `⛽ 1.2M · $3.45` shows
+today's burn at all times. From a script:
+
+```bash
+pm usage            # full report — today, all-time, by model, recent days
+pm usage --today    # just today's tokens and cost
+pm usage --json     # machine-readable totals + per-day / per-model breakdowns
+```
+
+It's strictly local — Foldview only tallies the JSONL Claude Code already
+writes to disk. Nothing is uploaded, no network is touched, and no API key is
+needed. Cost is estimated from published per-model rates, so treat it as a
+guide, not a bill. Multiple Claude data dirs are supported via
+`CLAUDE_CONFIG_DIR` (a `,`-separated list); otherwise `~/.claude` and
+`~/.config/claude` are checked.
+
 ## Keys
 
 | Key | Action |
@@ -133,6 +161,7 @@ in the picker from then on, alongside your other configuration.
 | `e` | open the project in `$EDITOR` (default `code`) |
 | `a` | AI terminals — open 1-9 Terminal windows running a detected or custom AI coding CLI in the project |
 | `A` | add a local app to the list (name @ port), saved to `~/.foldview.json` |
+| `u` | Claude Code usage — today's + all-time token and estimated-cost burn, from local logs |
 | `s` | pin a discovered local app |
 | `c` | copy the project path to the clipboard |
 | `/` | search / filter by name |
@@ -149,6 +178,7 @@ For scripts and other tools:
 ```bash
 pm --list ~/Documents       # plain stats table
 pm --json ~/Documents       # JSON
+pm usage --json             # Claude Code token + estimated-cost totals
 ```
 
 These stay unchanged by the AI terminals feature and the CLI bridge below.
