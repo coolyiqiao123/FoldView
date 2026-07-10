@@ -963,6 +963,7 @@ ${c(C.dim, 'LOCAL APPS')}
 ${c(C.dim, 'ADVANCED (menu-bar bridge — for scripts and the optional companion app)')}
   pm status --format menubar-json                  fast JSON status, no LOC/disk/git walks
   pm roots list [--json] | add <dir> | remove <dir> manage scanned project roots
+  pm aiclis list [--json] | add <name|abs-path> | remove <name|abs-path>  manage custom AI CLIs
   pm action open|start|stop|editor --project <dir> [--open]
   pm action ai --project <dir> --cli <abs-executable> --count <1-9>
   pm menubar [--force-install]                      install/launch the menu-bar companion
@@ -2023,6 +2024,48 @@ function cmdRoots(rest) {
   console.error('pm roots: expected list, add, or remove');
   process.exitCode = 1;
 }
+// Manage custom AI CLIs saved in ~/.foldview.json → aiClis. This is the CLI counterpart to the
+// TUI's `a` → `+` custom-CLI prompt, so the menu-bar companion (Settings → CLI) can add/remove
+// entries too instead of only mirroring `pm status`.
+function cmdAiclis(rest) {
+  const sub = rest[0];
+  if (!sub || sub === 'list') {
+    const discovered = discoverAIClis();
+    if (rest.includes('--json')) { console.log(JSON.stringify(discovered.map(c => ({ name: c.name, executable: c.executable, key: c.key })))); return; }
+    if (!discovered.length) { console.log('no AI CLIs found'); return; }
+    const known = new Set(KNOWN_AI_CLIS.map(k => k.name));
+    discovered.forEach(c => console.log(`${c.key ? `[${c.key}] ` : '    '}${c.name}${known.has(c.name) ? '' : ' (custom)'} → ${c.executable}`));
+    return;
+  }
+  if (sub === 'add') {
+    const value = rest[1];
+    if (!value) { console.error('pm aiclis add: requires an executable name or absolute path'); process.exitCode = 1; return; }
+    const result = resolveCustomCli(value);
+    if (!result.ok) { console.error(`pm aiclis add: ${result.error}`); process.exitCode = 1; return; }
+    const already = (readConfig().aiClis || []).some(a => a && a.executable === result.executable);
+    const ok = saveCustomCli({ name: result.name, executable: result.executable });
+    if (!ok) { console.error('pm aiclis add: could not write config'); process.exitCode = 1; return; }
+    console.log(already ? `already saved: ${result.name} → ${result.executable}` : `added AI CLI: ${result.name} → ${result.executable}`);
+    return;
+  }
+  if (sub === 'remove') {
+    const value = rest[1];
+    if (!value) { console.error('pm aiclis remove: requires a saved name or executable path'); process.exitCode = 1; return; }
+    const resolved = path.isAbsolute(value) ? value : (resolveExecutable(value) || null);
+    let removed = 0;
+    const ok = updateConfig(cfg => {
+      const before = Array.isArray(cfg.aiClis) ? cfg.aiClis : [];
+      cfg.aiClis = before.filter(a => !(a && (a.name === value || a.executable === value || (resolved && a.executable === resolved))));
+      removed = before.length - cfg.aiClis.length;
+    });
+    if (!ok) { console.error('pm aiclis remove: could not write config'); process.exitCode = 1; return; }
+    if (removed) console.log(`removed ${removed} AI CLI${removed === 1 ? '' : 's'} matching: ${value}`);
+    else { console.error(`pm aiclis remove: no saved AI CLI matching: ${value}`); process.exitCode = 1; }
+    return;
+  }
+  console.error('pm aiclis: expected list, add, or remove');
+  process.exitCode = 1;
+}
 async function actionOpen(proj) {
   const info = lightProjectInfo(proj.path);
   if (info.port && await checkPort(info.port)) { openUrl(`http://localhost:${info.port}`); console.log(`opened http://localhost:${info.port}`); return; }
@@ -2168,7 +2211,7 @@ function cmdServe(rest) {
   return startStaticServer(dir, startPort);
 }
 
-const SUBCOMMANDS = new Set(['status', 'roots', 'action', 'menubar', 'serve']);
+const SUBCOMMANDS = new Set(['status', 'roots', 'action', 'menubar', 'serve', 'aiclis']);
 function dispatchSubcommand(cmd, rest) {
   switch (cmd) {
     case 'status': return cmdStatus(rest);
@@ -2176,6 +2219,7 @@ function dispatchSubcommand(cmd, rest) {
     case 'action': return cmdAction(rest);
     case 'menubar': return cmdMenubar(rest);
     case 'serve': return cmdServe(rest);
+    case 'aiclis': return cmdAiclis(rest);
   }
 }
 
@@ -2218,7 +2262,7 @@ export {
   isPidAlive, pidCommandMatches, pidCwd, validateOwnership, findOwnedRegistryEntry, realpathSafe,
   // CLI bridge
   parseFlagValue, lightProjectInfo, buildMenubarStatus, cmdStatus, cmdRoots, cmdAction, cmdMenubar,
-  dispatchSubcommand, actionOpen, actionStart, actionStop, actionEditor, actionAi,
+  dispatchSubcommand, actionOpen, actionStart, actionStop, actionEditor, actionAi, cmdAiclis,
   // static site serving
   staticSiteDir, cmdServe, startStaticServer, isSelfProject,
   // footer helper (for rendering assertions)

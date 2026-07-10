@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { freshHome, tmpDir, FOLDER_MJS } from './helpers.mjs';
+import { freshHome, tmpDir, makeBin, FOLDER_MJS } from './helpers.mjs';
 
 const home = freshHome();
 
@@ -108,4 +108,43 @@ test('status --format menubar-json: warm refresh comfortably meets the <500ms ta
   run(['--json', root]);
   const fullMs = Date.now() - t1;
   t.diagnostic(`fast path (status --format menubar-json): ${fastMs}ms — full scan (--json): ${fullMs}ms`);
+});
+
+test('pm aiclis add/list/remove: round-trips a custom AI CLI through ~/.foldview.json', () => {
+  // Each aiclis test gets its own HOME so their config writes never collide with the shared one.
+  const aiHome = tmpDir('foldview-aiclis-add-');
+  const bindir = tmpDir('foldview-aiclis-bin-');
+  const exe = makeBin(bindir, 'my-agent', '#!/bin/sh\nexit 0\n');
+  const withHome = { env: { HOME: aiHome } };
+
+  const added = run(['aiclis', 'add', exe], withHome);
+  assert.match(added, /added AI CLI/);
+  assert.match(added, new RegExp(exe.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+
+  // adding the same executable again is idempotent, reported as already-saved (still exit 0).
+  assert.match(run(['aiclis', 'add', exe], withHome), /already saved/);
+
+  const listed = JSON.parse(run(['aiclis', 'list', '--json'], withHome));
+  const found = listed.find(c => c.executable === exe);
+  assert.ok(found, 'the custom CLI should appear in `aiclis list --json`');
+  assert.equal(found.name, 'my-agent');
+
+  const removed = run(['aiclis', 'remove', exe], withHome);
+  assert.match(removed, /removed 1 AI CLI/);
+  assert.ok(!JSON.parse(run(['aiclis', 'list', '--json'], withHome)).some(c => c.executable === exe));
+});
+
+test('pm aiclis add: rejects a relative path and a shell expression without writing config', () => {
+  const aiHome = tmpDir('foldview-aiclis-reject-');
+  const withHome = { env: { HOME: aiHome } };
+  assert.throws(() => run(['aiclis', 'add', './relative-agent'], withHome));
+  assert.throws(() => run(['aiclis', 'add', 'foo | bar'], withHome));
+  assert.throws(() => run(['aiclis', 'add'], withHome));
+});
+
+test('pm aiclis remove: exits non-zero when nothing matches, and rejects an unknown subcommand', () => {
+  const aiHome = tmpDir('foldview-aiclis-nomatch-');
+  const withHome = { env: { HOME: aiHome } };
+  assert.throws(() => run(['aiclis', 'remove', '/nope/not-installed'], withHome));
+  assert.throws(() => run(['aiclis', 'bogus'], withHome));
 });

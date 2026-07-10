@@ -129,11 +129,13 @@ bridge that does the same thing Node-side.
   become a second writer of `~/.foldview.json` (per spec), so full
   cross-process persistence of these two settings needs a CLI subcommand
   (e.g. `pm config set menubar.refreshSeconds <n>`) that does not exist yet.
-- **Settings → CLI → custom AI CLI management** is read-only (lists whatever
-  `pm status` currently reports in `aiClis`). Adding/removing a custom CLI from
-  this window would need a subcommand like `pm aiclis add/remove` that is not
-  part of the frozen bridge either; the TUI's own `+` custom-CLI flow
-  (`folder.mjs`) is unaffected and remains the source of truth.
+- **Settings → CLI → custom AI CLI management**: the CLI bridge now exposes
+  `pm aiclis list [--json] | add <name|abs-path> | remove <name|abs-path>`
+  (mirroring the TUI's `+` custom-CLI flow and reusing the same
+  validate/resolve/save helpers in `folder.mjs`), so a future menu-bar
+  Settings → CLI window can become read-write by shelling out to it instead of
+  only mirroring `pm status`. Wiring that UI up is still to do; the subcommand
+  is the missing piece it was blocked on.
 - **Launch at login** (`SMAppService.mainApp.register()`) compiles and is
   wired to the Settings toggle, but `SMAppService` registration is only
   meaningful for an installed, bundled `.app` — it cannot be manually verified
