@@ -1,7 +1,7 @@
 import Foundation
 
 /// Codable model for the FROZEN `pm status --format menubar-json` schemaVersion-1
-/// payload (see swarm/2026-07-02-ai-terminals/GLOBAL-CONTEXT.md). Decoding is
+/// payload emitted by `folder.mjs`. Decoding is
 /// forward-compatible: unknown JSON keys are ignored by `JSONDecoder` because they
 /// have no matching `CodingKeys` case, and every field that the spec marks optional
 /// is modeled as `Optional` so a future payload may omit it without failing decode.

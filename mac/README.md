@@ -3,11 +3,9 @@
 A native macOS menu-bar companion for [Foldview](../README.md). It is a thin
 presentation layer over the same `pm` CLI the TUI uses — it never rescans
 projects, never writes `~/.foldview.json` directly, and never launches AppleScript
-for the multi-window AI-terminal grid (that stays in `folder.mjs`). See
-`../docs/superpowers/specs/2026-07-02-ai-terminals-design.md` §"macOS menu-bar
-companion" for the full product spec and
-`../swarm/2026-07-02-ai-terminals/GLOBAL-CONTEXT.md` for the frozen CLI/JSON
-contracts this target is built against.
+for the multi-window AI-terminal grid (that stays in `folder.mjs`). It is built
+against the frozen `pm status --format menubar-json` schemaVersion-1 contract
+(see `../README.md` §"CLI bridge").
 
 ## Requirements
 

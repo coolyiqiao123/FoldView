@@ -2,7 +2,7 @@ import Foundation
 @testable import FoldviewMenuBar
 
 /// Shared fixtures for decoding and store tests. JSON strings mirror the frozen
-/// schemaVersion-1 example in swarm/2026-07-02-ai-terminals/GLOBAL-CONTEXT.md;
+/// schemaVersion-1 payload emitted by `pm status --format menubar-json`;
 /// the programmatic builders below are for tests that don't need to exercise
 /// JSONDecoder itself.
 enum PayloadFixtures {
