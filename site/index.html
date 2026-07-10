@@ -342,15 +342,82 @@
 
   :focus-visible{outline:2px solid var(--brand); outline-offset:3px; border-radius:6px}
 
+  /* ---------- custom cursor: filled blue circle + glow ---------- */
+  /* only on true mouse pointers — never on touch (iPhone/iPad) */
+  @media(hover:hover) and (pointer:fine){
+    body.has-cursor{cursor:none}
+    body.has-cursor a,
+    body.has-cursor button,
+    body.has-cursor .icon-btn,
+    body.has-cursor .cmd,
+    body.has-cursor .btn,
+    body.has-cursor .row,
+    body.has-cursor [data-copy],
+    body.has-cursor .cb-copy{cursor:none}
+    .cursor-dot,.cursor-ring{
+      position:fixed; top:0; left:0; z-index:9999; pointer-events:none;
+      border-radius:50%; transform:translate3d(-50%,-50%,0);
+      will-change:transform; opacity:0; transition:opacity .25s ease;
+    }
+    .cursor-dot{
+      width:12px; height:12px;
+      background:radial-gradient(circle at 35% 30%,#CFEBFF,var(--brand-2) 70%);
+      box-shadow:0 0 10px 2px rgba(143,211,255,.85), 0 0 22px 6px rgba(110,168,255,.55);
+    }
+    .cursor-ring{
+      width:34px; height:34px;
+      border:1.5px solid rgba(143,211,255,.55);
+      box-shadow:0 0 14px 2px rgba(143,211,255,.25) inset, 0 0 12px 1px rgba(143,211,255,.2);
+      transition:opacity .25s ease, width .2s ease, height .2s ease, border-color .2s ease, background .2s ease;
+    }
+    body.cursor-active .cursor-dot,
+    body.cursor-active .cursor-ring{opacity:1}
+    /* grow + fill on interactive hover */
+    body.cursor-hot .cursor-ring{
+      width:46px; height:46px;
+      border-color:rgba(143,211,255,.9);
+      background:rgba(143,211,255,.10);
+    }
+    body.cursor-down .cursor-ring{width:26px; height:26px}
+    body.cursor-down .cursor-dot{width:9px; height:9px}
+  }
+
+  /* ---------- touch (iPhone) interactions ---------- */
+  /* tap ripple that echoes the desktop cursor glow at the finger */
+  .tap-glow{
+    position:fixed; z-index:9998; pointer-events:none;
+    width:14px; height:14px; border-radius:50%;
+    transform:translate(-50%,-50%);
+    background:radial-gradient(circle at 50% 50%,rgba(207,235,255,.9),rgba(110,168,255,.5) 60%,transparent 72%);
+    animation:tap-pop .6s ease-out forwards;
+  }
+  @keyframes tap-pop{
+    0%  {opacity:.9; transform:translate(-50%,-50%) scale(.3)}
+    100%{opacity:0;  transform:translate(-50%,-50%) scale(3.2)}
+  }
+  /* swipe affordance shown on the terminal for touch users */
+  .swipe-hint{
+    display:none; align-items:center; gap:7px;
+    margin:10px auto 0; width:max-content;
+    font-family:var(--mono); font-size:11.5px; color:var(--faint);
+  }
+  .swipe-hint .sh-ico{color:var(--brand); animation:sh-bob 1.8s ease-in-out infinite}
+  @keyframes sh-bob{0%,100%{transform:translateY(-2px)} 50%{transform:translateY(2px)}}
+  @media(hover:none) and (pointer:coarse){ .swipe-hint{display:flex} }
+  .term.touch-active{outline:1px solid rgba(143,211,255,.35); outline-offset:2px}
+
   @media(prefers-reduced-motion:reduce){
     *{animation:none !important; transition:none !important; scroll-behavior:auto !important}
     [data-reveal]{opacity:1; transform:none}
+    .cursor-dot,.cursor-ring{display:none}
   }
 </style>
 </head>
 <body>
 <div class="mesh" aria-hidden="true"></div>
 <div class="grid-ovl" aria-hidden="true"></div>
+<div class="cursor-ring" aria-hidden="true"></div>
+<div class="cursor-dot" aria-hidden="true"></div>
 
 <!-- ===================== NAV ===================== -->
 <header class="nav">
@@ -424,6 +491,9 @@
             <span>↑↓ move · ↵ launch · d start · x stop · / find · ? help · q quit</span>
             <span class="cursor" aria-hidden="true"></span>
           </div>
+        </div>
+        <div class="swipe-hint" aria-hidden="true">
+          <span class="sh-ico">↕</span> swipe the list to browse · tap a project to select
         </div>
       </div>
     </div>
@@ -784,11 +854,80 @@
   });
 
   // gently cycle to feel alive (pauses on hover, off under reduced-motion)
+  var paused = false;
   if(!reduce){
-    var term = listEl.closest('.term'); var paused = false;
+    var term = listEl.closest('.term');
     term.addEventListener('mouseenter', function(){ paused = true; });
     term.addEventListener('mouseleave', function(){ paused = false; });
     setInterval(function(){ if(!paused){ idx = (idx+1) % projects.length; paint(); } }, 2900);
+  }
+
+  /* ---------- custom cursor: filled blue circle + glow ---------- */
+  var fine = window.matchMedia && matchMedia('(hover:hover) and (pointer:fine)').matches;
+  if(fine && !reduce){
+    var dot = document.querySelector('.cursor-dot');
+    var ring = document.querySelector('.cursor-ring');
+    if(dot && ring){
+      document.body.classList.add('has-cursor');
+      var mx=0,my=0, rx=0,ry=0, active=false, raf=null;
+      var hotSel = 'a,button,.icon-btn,.cmd,.btn,.row,[data-copy],.cb-copy,input,textarea,summary';
+      function tick(){
+        // ring eases toward the pointer for a soft trailing glow; dot is exact
+        rx += (mx-rx)*0.22; ry += (my-ry)*0.22;
+        dot.style.transform  = 'translate3d('+mx+'px,'+my+'px,0) translate(-50%,-50%)';
+        ring.style.transform = 'translate3d('+rx+'px,'+ry+'px,0) translate(-50%,-50%)';
+        if(Math.abs(mx-rx)>0.1 || Math.abs(my-ry)>0.1){ raf = requestAnimationFrame(tick); }
+        else { raf = null; }
+      }
+      window.addEventListener('mousemove', function(e){
+        mx=e.clientX; my=e.clientY;
+        if(!active){ active=true; document.body.classList.add('cursor-active'); }
+        if(!raf) raf = requestAnimationFrame(tick);
+      }, {passive:true});
+      document.addEventListener('mouseleave', function(){ document.body.classList.remove('cursor-active'); active=false; });
+      document.addEventListener('mousedown', function(){ document.body.classList.add('cursor-down'); });
+      document.addEventListener('mouseup',   function(){ document.body.classList.remove('cursor-down'); });
+      document.addEventListener('mouseover', function(e){
+        document.body.classList.toggle('cursor-hot', !!(e.target.closest && e.target.closest(hotSel)));
+      }, {passive:true});
+    }
+  }
+
+  /* ---------- iPhone / touch interactions ---------- */
+  var coarse = window.matchMedia && matchMedia('(hover:none) and (pointer:coarse)').matches;
+  if(coarse){
+    // 1) tap-glow ripple — echoes the desktop cursor glow at the finger
+    if(!reduce){
+      document.addEventListener('touchstart', function(e){
+        var t = e.changedTouches && e.changedTouches[0]; if(!t) return;
+        var g = document.createElement('span');
+        g.className = 'tap-glow';
+        g.style.left = t.clientX+'px'; g.style.top = t.clientY+'px';
+        document.body.appendChild(g);
+        setTimeout(function(){ g.remove(); }, 620);
+      }, {passive:true});
+    }
+
+    // 2) swipe up/down on the terminal list to browse projects
+    var tStartY=0, tStartX=0, swiping=false;
+    var termEl = listEl.closest('.term');
+    listEl.addEventListener('touchstart', function(e){
+      var t=e.touches[0]; tStartY=t.clientY; tStartX=t.clientX; swiping=true;
+      paused = true; if(termEl) termEl.classList.add('touch-active');
+    }, {passive:true});
+    listEl.addEventListener('touchmove', function(e){
+      if(!swiping) return;
+      var t=e.touches[0]; var dy=t.clientY-tStartY, dx=t.clientX-tStartX;
+      if(Math.abs(dy) > 34 && Math.abs(dy) > Math.abs(dx)){
+        idx = dy<0 ? (idx+1) % projects.length
+                   : (idx-1+projects.length) % projects.length;
+        paint();
+        tStartY=t.clientY; tStartX=t.clientX;   // step per swipe distance
+      }
+    }, {passive:true});
+    function endSwipe(){ swiping=false; if(termEl) termEl.classList.remove('touch-active'); setTimeout(function(){ paused=false; }, 1200); }
+    listEl.addEventListener('touchend', endSwipe, {passive:true});
+    listEl.addEventListener('touchcancel', endSwipe, {passive:true});
   }
 })();
 </script>
