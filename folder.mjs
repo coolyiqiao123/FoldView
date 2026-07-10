@@ -905,6 +905,149 @@ function readLogPort(logFile) {
   return null;
 }
 
+// ═════════════════ Claude Code usage (local credit burn) ══════════════
+// "How much have I burned?" — read Claude Code's own local session logs and total the tokens
+// and estimated cost, ccusage-style. Strictly local: we only tally the JSONL Claude Code
+// already writes under ~/.claude/projects/; nothing is uploaded, no network is touched, and no
+// API key is needed. Cost is an estimate from published per-model rates — a guide, not a bill.
+const USAGE_PRICING = [                           // matched by substring; $ per 1M tokens
+  [/opus/,   { in: 15,  out: 75, cacheWrite: 18.75, cacheRead: 1.5  }],
+  [/sonnet/, { in: 3,   out: 15, cacheWrite: 3.75,  cacheRead: 0.3  }],
+  [/haiku/,  { in: 0.8, out: 4,  cacheWrite: 1,     cacheRead: 0.08 }],
+];
+const USAGE_PRICE_DEFAULT = { in: 3, out: 15, cacheWrite: 3.75, cacheRead: 0.3 };  // unknown model → sonnet-ish
+function usagePriceFor(model) {
+  const m = String(model || '').toLowerCase();
+  for (const [re, price] of USAGE_PRICING) if (re.test(m)) return price;
+  return USAGE_PRICE_DEFAULT;
+}
+function usageEntryCost(u, model) {
+  const p = usagePriceFor(model);
+  return ((u.input_tokens || 0) * p.in
+        + (u.output_tokens || 0) * p.out
+        + (u.cache_creation_input_tokens || 0) * p.cacheWrite
+        + (u.cache_read_input_tokens || 0) * p.cacheRead) / 1e6;
+}
+function blankUsage() { return { input: 0, output: 0, cacheWrite: 0, cacheRead: 0, cost: 0, messages: 0 }; }
+function usageTokens(a) { return a.input + a.output + a.cacheWrite + a.cacheRead; }
+function usageDayKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function usageDay(ts) { const t = Date.parse(ts || ''); return t ? usageDayKey(new Date(t)) : null; }
+function usageTodayKey() { return usageDayKey(new Date()); }
+// candidate data dirs: honor CLAUDE_CONFIG_DIR (may be a `,`-separated list), else the two
+// standard locations; only those with an existing projects/ subdir are walked.
+function claudeUsageDirs() {
+  const roots = [];
+  const env = process.env.CLAUDE_CONFIG_DIR;
+  if (env) for (const d of env.split(',')) { const t = d.trim(); if (t) roots.push(t); }
+  else roots.push(path.join(HOME, '.claude'), path.join(HOME, '.config', 'claude'));
+  return roots.map(d => path.join(d, 'projects'))
+    .filter(d => { try { return fs.statSync(d).isDirectory(); } catch { return false; } });
+}
+// recursively collect *.jsonl under a dir (Claude nests one directory per project).
+function collectJsonl(dir, out, cap = 5000) {
+  let ents; try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return out; }
+  for (const e of ents) {
+    if (out.length >= cap) break;
+    const full = path.join(dir, e.name);
+    if (e.isDirectory()) collectJsonl(full, out, cap);
+    else if (e.isFile() && e.name.endsWith('.jsonl')) out.push(full);
+  }
+  return out;
+}
+// tally every assistant-message usage record across all local logs, deduped by message-id +
+// request-id (the same assistant turn can be replayed into more than one line). Returns totals,
+// today's slice, and per-day / per-model breakdowns.
+function readClaudeUsage() {
+  const dirs = claudeUsageDirs();
+  const files = [];
+  for (const d of dirs) collectJsonl(d, files);
+  const totals = blankUsage();
+  const byDay = new Map();      // 'YYYY-MM-DD' -> usage
+  const byModel = new Map();    // model        -> usage
+  const seen = new Set();
+  let lastTs = 0;
+  for (const file of files) {
+    let text; try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line || line[0] !== '{') continue;
+      let rec; try { rec = JSON.parse(line); } catch { continue; }
+      const msg = rec && rec.message;
+      const u = msg && msg.usage;
+      if (!u || typeof u !== 'object') continue;
+      const model = msg.model || rec.model || 'unknown';
+      if (model === '<synthetic>') continue;      // Claude's placeholder for local/aborted turns
+      const key = (msg.id || '') + ':' + (rec.requestId || '');
+      if (key !== ':') { if (seen.has(key)) continue; seen.add(key); }
+      const cost = typeof rec.costUSD === 'number' ? rec.costUSD : usageEntryCost(u, model);
+      const add = acc => {
+        acc.input += u.input_tokens || 0; acc.output += u.output_tokens || 0;
+        acc.cacheWrite += u.cache_creation_input_tokens || 0; acc.cacheRead += u.cache_read_input_tokens || 0;
+        acc.cost += cost; acc.messages += 1;
+      };
+      add(totals);
+      const day = usageDay(rec.timestamp);
+      if (day) { if (!byDay.has(day)) byDay.set(day, blankUsage()); add(byDay.get(day)); }
+      if (!byModel.has(model)) byModel.set(model, blankUsage());
+      add(byModel.get(model));
+      const t = Date.parse(rec.timestamp || ''); if (t && t > lastTs) lastTs = t;
+    }
+  }
+  return { totals, byDay, byModel, files: files.length, dirs, lastTs, today: byDay.get(usageTodayKey()) || blankUsage() };
+}
+function fmtUSD(n) {
+  if (n == null) return '—';
+  if (n === 0) return '$0';
+  if (n < 10)   return '$' + n.toFixed(3);
+  if (n < 1000) return '$' + n.toFixed(2);
+  return '$' + Math.round(n).toLocaleString('en-US');
+}
+// a one-line breakdown of the four token buckets, e.g. "in 120k · out 45k · cache-w 80k · cache-r 900k"
+function usageBreakdown(a) {
+  return c(C.faint, `in ${fmtK(a.input)} · out ${fmtK(a.output)} · cache-w ${fmtK(a.cacheWrite)} · cache-r ${fmtK(a.cacheRead)}`);
+}
+// shared human-readable report (colored lines), used by both `pm usage` and the TUI overlay.
+function usageReport(usage) {
+  const L = [];
+  L.push('', '  ' + gradient('foldview', BRAND_GRAD) + c(C.orange, ' 🚀') +
+    c(C.dim, '  — Claude Code usage') + c(C.faint, '  (local logs · estimated cost)'), '');
+  if (!usage || usage.files === 0) {
+    L.push(c(C.dim, '  No Claude Code usage logs found.'));
+    L.push(c(C.faint, `  Looked in: ${(usage && usage.dirs.length ? usage.dirs : [path.join(HOME, '.claude', 'projects')]).join('  ')}`));
+    L.push(c(C.faint, '  Run Claude Code at least once (or set CLAUDE_CONFIG_DIR), then try again.'));
+    L.push('');
+    return L;
+  }
+  const t = usage.today, all = usage.totals;
+  L.push(c(C.dim, `  TODAY`) + c(C.faint, `  ${usageTodayKey()}`));
+  L.push('   ' + c(C.text, 'Tokens ') + c(C.amber, fmtK(usageTokens(t)).padStart(9)) + '    ' +
+    c(C.text, 'Cost ') + c(C.green, fmtUSD(t.cost)));
+  L.push('   ' + usageBreakdown(t), '');
+  L.push(c(C.dim, '  ALL TIME'));
+  L.push('   ' + c(C.text, 'Tokens ') + c(C.amber, fmtK(usageTokens(all)).padStart(9)) + '    ' +
+    c(C.text, 'Cost ') + c(C.green, fmtUSD(all.cost)));
+  L.push('   ' + usageBreakdown(all));
+  L.push('   ' + c(C.faint, `${fmtN(all.messages)} messages · ${usage.files} session file${usage.files === 1 ? '' : 's'}` +
+    (usage.lastTs ? ` · last ${ago(usage.lastTs)}` : '')), '');
+  const models = [...usage.byModel.entries()].sort((a, b) => usageTokens(b[1]) - usageTokens(a[1])).slice(0, 6);
+  if (models.length) {
+    L.push(c(C.dim, '  BY MODEL'));
+    for (const [name, m] of models)
+      L.push('   ' + c(C.text, trunc(name, 26).padEnd(27)) + c(C.amber, fmtK(usageTokens(m)).padStart(9)) + '   ' + c(C.green, fmtUSD(m.cost)));
+    L.push('');
+  }
+  const days = [...usage.byDay.entries()].sort((a, b) => (a[0] < b[0] ? 1 : -1)).slice(0, 7);
+  if (days.length) {
+    L.push(c(C.dim, '  RECENT DAYS'));
+    for (const [day, d] of days)
+      L.push('   ' + c(C.faint, day + '   ') + c(C.amber, fmtK(usageTokens(d)).padStart(9)) + '   ' + c(C.green, fmtUSD(d.cost)));
+    L.push('');
+  }
+  L.push(c(C.faint, '  Cost is estimated from published per-model rates — a guide, not a bill.'));
+  return L;
+}
+
 // ═══════════════════════════ non-TUI modes ════════════════════════════
 function printList(root, asJson) {
   const projects = buildProjectList(root);
@@ -945,13 +1088,14 @@ ${c(C.dim, 'USAGE')}
   pm --list [path]         print a plain stats table and exit
   pm --json [path]         print stats as JSON and exit
   pm serve <dir> [port]    serve a static site dir on localhost (zero-dependency)
+  pm usage [--today|--json] Claude Code token + estimated-cost burn, from local logs
   pm --help                (command aliases: folderpreview, project-manager, foldview)
 
 ${c(C.dim, 'KEYS (in the dashboard)')}
   ↑ ↓          move
   ↵            🚦 launch — open the website (starts the dev server, or serves a static site, no exit)
   d  start dev (background)   x  stop / remove app   D  dev (foreground)   o  localhost
-  e  editor    a  AI terminals    A  add app    /  find    r  rescan    ?  help    q  quit
+  e  editor    a  AI terminals    A  add app    u  usage    /  find    r  rescan    ?  help    q  quit
 
   a opens AI terminals: pick a detected coding CLI (or + for a custom one), then how many
   windows (1-9) — each opens in the project directory, tiled so none of them overlap.
@@ -991,6 +1135,7 @@ const state = {
   // drill-in navigation: `trail` is the breadcrumb of projects you've entered (root = empty);
   // `stack` holds a saved {projects,view,sel,scroll,search} snapshot per level so ← restores it.
   trail: [], stack: [],
+  usage: null,           // cached Claude Code usage snapshot (footer glance + `u` overlay); null until first read
 };
 const SPIN = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -1070,6 +1215,7 @@ function launchMenu(cols) {                     // the Launch menu — pinned to
 
 function render() {
   if (state.mode === 'help') return renderHelp();
+  if (state.mode === 'usage') return renderUsage();
   const { cols, rows } = dims();
   if (cols < 64 || rows < 16) {
     out('\x1b[H\x1b[2J' + c(C.dim, 'terminal too small — resize to at least 64×16\n'));
@@ -1168,16 +1314,29 @@ function footer(cols) {
   }
   // greedily include hints in priority order until we run out of width — so it never wraps
   const all = [['↑↓', 'move'], ['↵', 'launch'], ['→', 'enter'], ['←', 'back'], ['d', 'start'], ['x', 'stop'],
-               ['a', 'AI'], ['p', 'push'], ['A', 'add app'], ['/', 'find'], ['?', 'help'], ['q', 'quit'], ['o', 'open'], ['e', 'editor']];
+               ['a', 'AI'], ['p', 'push'], ['u', 'usage'], ['A', 'add app'], ['/', 'find'], ['?', 'help'], ['q', 'quit'], ['o', 'open'], ['e', 'editor']];
+  // a right-aligned "today's burn" glance from the cached usage snapshot — reserve its width first
+  const glance = usageGlance();
+  const reserve = glance ? visLen(glance) + 3 : 0;   // glance + a gap so the two never collide
   const parts = []; let used = 1;                  // leading space
   for (const [k, v] of all) {
     const segVis = visLen(k) + 1 + v.length;
     const sepVis = parts.length ? 3 : 0;           // ' · '
-    if (used + sepVis + segVis > cols - 1) break;
+    if (used + sepVis + segVis > cols - 1 - reserve) break;
     parts.push(c(C.amber, k) + ' ' + c(C.faint, v));
     used += sepVis + segVis;
   }
-  return ' ' + parts.join(c(C.border, ' · '));
+  const left = ' ' + parts.join(c(C.border, ' · '));
+  if (!glance) return left;
+  return padTo(left, cols - 1 - visLen(glance)) + glance + ' ';
+}
+// compact footer glance of today's Claude Code burn, e.g. "⛽ 1.2M · $3.45"; '' when no data yet.
+function usageGlance() {
+  const u = state.usage;
+  if (!u || u.files === 0) return '';
+  const toks = usageTokens(u.today);
+  if (!toks && !u.today.cost) return c(C.faint, '⛽ today —');
+  return c(C.faint, '⛽ ') + c(C.text, fmtK(toks)) + c(C.faint, ' · ') + c(C.green, fmtUSD(u.today.cost));
 }
 
 function listPane(L, H) {
@@ -1366,6 +1525,7 @@ function renderHelp() {
     '   ' + c(C.amber, 's  x') + c(C.faint, '       on an app row: s pins a discovered app · x removes a pinned app / hides a discovered one'),
     '   ' + c(C.amber, 'c') + c(C.faint, '          copy the project path to the clipboard'),
     '   ' + c(C.amber, '/') + c(C.faint, '          search / filter projects by name'),
+    '   ' + c(C.amber, 'u') + c(C.faint, '          Claude Code usage — today\'s + all-time token and estimated-cost burn, from local logs'),
     '   ' + c(C.amber, 'r') + c(C.faint, '          rescan projects and ports'), '',
     '  ' + c(C.green, '●') + c(C.faint, ' = launchable + live   ') + c(C.green, '○') + c(C.faint, ' = launchable (stopped)   ') + c(C.notRun, '●') + c(C.faint, ' = not launchable'),
     '  ' + c(C.dim, 'apps') + c(C.faint, ' — detected (e.g. claude-mem, only if installed) · discovered (any live localhost server) · pinned (~/.foldview.json); ↵ opens them'), '',
@@ -1373,6 +1533,15 @@ function renderHelp() {
   ];
   out(L.join('\n') + '\n');
 }
+
+// full-screen Claude Code usage overlay (u) — same "press any key to go back" model as help.
+function renderUsage() {
+  out('\x1b[H\x1b[2J');
+  const lines = usageReport(state.usage || readClaudeUsage());
+  out(lines.join('\n') + '\n\n  ' + c(C.amber, 'press any key to go back') + '\n');
+}
+// (re)read the local Claude logs into state.usage — cheap enough to run on demand (u / rescan).
+function refreshUsage() { try { state.usage = readClaudeUsage(); } catch { state.usage = null; } }
 
 // ───────────────────────────── actions ────────────────────────────────
 function openUrl(url) {                          // platform-native "open in default app"
@@ -1760,6 +1929,7 @@ function activate() {
 }
 function onKey(str, key) {
   if (state.mode === 'help') { state.mode = 'list'; render(); return; }
+  if (state.mode === 'usage') { state.mode = 'list'; render(); return; }
 
   if (state.searching) {                       // list-mode type-ahead filter
     const n = key.name;
@@ -1863,6 +2033,7 @@ function onKey(str, key) {
         case 's': { const p = state.view[state.sel]; if (p) saveDiscovered(p); break; }
         case 'c': { const p = dirEntry(state.view[state.sel]); if (p) copyPath(p.path); break; }
         case 'r': rescan(); break;
+        case 'u': refreshUsage(); state.mode = 'usage'; break;
         case '/': state.searching = true; state.search = ''; break;
         case '?': state.mode = 'help'; break;
         default: return;
@@ -1880,6 +2051,7 @@ function rescan() {
   state.queue = state.projects.slice();
   state.busy = true; pumpQueue();
   scanPorts().then(s => { state.livePorts = s; mergeDiscovered(); render(); });
+  refreshUsage();
   render();
 }
 
@@ -1921,6 +2093,8 @@ function startTUI() {
   if (state.view[0]) state.cache.set(state.view[0].path, computeStats(state.view[0]));
   state.busy = true; pumpQueue();
   scanPorts().then(s => { state.livePorts = s; mergeDiscovered(); render(); });
+  // read local Claude logs off the first paint so a large history never delays startup
+  setTimeout(() => { refreshUsage(); render(); }, 0);
   render();
 }
 
@@ -2168,7 +2342,31 @@ function cmdServe(rest) {
   return startStaticServer(dir, startPort);
 }
 
-const SUBCOMMANDS = new Set(['status', 'roots', 'action', 'menubar', 'serve']);
+// `pm usage [--json] [--today]` — total Claude Code's local token/cost burn (ccusage-style).
+function cmdUsage(rest) {
+  const usage = readClaudeUsage();
+  if (rest.includes('--json')) {
+    const shape = a => ({ ...a, tokens: usageTokens(a) });
+    const byDay = {}; for (const [k, v] of usage.byDay) byDay[k] = shape(v);
+    const byModel = {}; for (const [k, v] of usage.byModel) byModel[k] = shape(v);
+    console.log(JSON.stringify({
+      totals: shape(usage.totals), today: shape(usage.today), byDay, byModel,
+      files: usage.files, dirs: usage.dirs,
+      lastActivity: usage.lastTs ? new Date(usage.lastTs).toISOString() : null,
+    }));
+    return;
+  }
+  if (rest.includes('--today') && usage.files) {
+    const t = usage.today;
+    console.log(`${gradient('foldview', BRAND_GRAD)}${c(C.orange, ' 🚀')}${c(C.dim, '  Claude Code usage · today')} ${c(C.faint, usageTodayKey())}`);
+    console.log('  ' + c(C.text, 'Tokens ') + c(C.amber, fmtK(usageTokens(t))) + '   ' + c(C.text, 'Cost ') + c(C.green, fmtUSD(t.cost)));
+    console.log('  ' + usageBreakdown(t));
+    return;
+  }
+  console.log(usageReport(usage).join('\n'));
+}
+
+const SUBCOMMANDS = new Set(['status', 'roots', 'action', 'menubar', 'serve', 'usage']);
 function dispatchSubcommand(cmd, rest) {
   switch (cmd) {
     case 'status': return cmdStatus(rest);
@@ -2176,6 +2374,7 @@ function dispatchSubcommand(cmd, rest) {
     case 'action': return cmdAction(rest);
     case 'menubar': return cmdMenubar(rest);
     case 'serve': return cmdServe(rest);
+    case 'usage': return cmdUsage(rest);
   }
 }
 
@@ -2221,6 +2420,8 @@ export {
   dispatchSubcommand, actionOpen, actionStart, actionStop, actionEditor, actionAi,
   // static site serving
   staticSiteDir, cmdServe, startStaticServer, isSelfProject,
+  // Claude Code usage (local credit burn)
+  readClaudeUsage, usagePriceFor, usageEntryCost, usageTokens, usageReport, cmdUsage, claudeUsageDirs,
   // footer helper (for rendering assertions)
   footerAi, footer, keyhints, stripAnsi, onKey, computeStats, scanProjects,
   // sub-features / drill-in navigation
