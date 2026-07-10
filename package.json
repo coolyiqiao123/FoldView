@@ -1,20 +1,22 @@
 {
-  "name": "lazyproj",
+  "name": "folderpreview",
   "version": "1.3.0",
-  "description": "project manager 📁 — a zero-dependency terminal launcher for local projects: a 🚀 Launch menu pinned to the top; press ↵ to open a project's site (starts the dev server in the background if needed), plus lines of code, disk/package size, language breakdown, git status, and live-localhost detection.",
+  "description": "Foldview — a friendly terminal home for projects, local apps, and AI coding agents. A zero-dependency terminal workspace and launchpad for vibe coding: a 🚦 Launch menu pinned to the top, AI terminals (open 1-9 Terminal windows running a detected or custom AI coding CLI), plus lines of code, disk/package size, language breakdown, git status, and live-localhost detection.",
   "type": "module",
   "bin": {
     "pm": "folder.mjs",
-    "lazyproj": "folder.mjs",
+    "folderpreview": "folder.mjs",
     "project-manager": "folder.mjs",
-    "folder": "folder.mjs"
+    "foldview": "folder.mjs"
   },
   "scripts": {
-    "start": "node folder.mjs"
+    "start": "node folder.mjs",
+    "test": "node --test",
+    "postinstall": "node scripts/postinstall.mjs"
   },
   "engines": {
     "node": ">=18"
   },
-  "keywords": ["cli", "tui", "dashboard", "loc", "projects", "terminal", "project-manager"],
+  "keywords": ["terminal workspace", "launchpad", "ai coding", "vibe coding", "local-first", "tui", "cli", "dashboard", "projects", "loc", "project-manager"],
   "license": "MIT"
 }
