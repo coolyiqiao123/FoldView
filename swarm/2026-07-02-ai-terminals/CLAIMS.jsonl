@@ -1,0 +1,12 @@
+{"team":0,"event":"init","what":"swarm shared brain created","ts":"2026-07-02T13:43:07Z"}
+{"team":1,"event":"start","what":"Phase A-D: AI terminals full spec, CLI bridge, registry, rebrand copy, tests","ts":"2026-07-02T13:45:05Z"}
+{"team":2,"event":"start","what":"README.md + package.json Foldview rebrand","ts":"2026-07-02T13:48:00Z"}
+{"team":2,"event":"done","what":"README.md rewritten (Foldview brand, quick start, AI terminals flow, CLI bridge, menu-bar companion, config schema); package.json description/keywords rebranded + test script added","ts":"2026-07-02T13:48:34Z"}
+{"team":4,"event":"start","what":"native menu-bar companion: Package.swift, Sources/FoldviewMenuBar, Tests/FoldviewMenuBarTests per frozen contracts","ts":"2026-07-02T13:51:48Z"}
+{"team":3,"event":"start","what":"site rebrand: hero/meta/OG copy, AI-terminals flagship bento card, install-command + repo-link accuracy fix (foldview->folderpreview/lazyproj), stale 'project manager' TUI mockup text","ts":"2026-07-02T13:52:26Z"}
+{"team":3,"event":"done","what":"site rebrand complete: hero/meta/OG use frozen tagline+short-desc+trust statement, AI-terminals flagship bento card + local-apps card, keys table + mockups updated with 'a', fixed real bugs (install cmd foldview->folderpreview, GitHub links foldview->real remote lazyproj), html.parser tag-balance check clean","ts":"2026-07-02T13:56:15Z"}
+{"team":4,"event":"done","what":"mac/ SwiftPM package complete: FoldviewApp/AppStore/FoldviewCLI/MenuBarPayload/ProjectRowModel/FoldviewTheme + 4 views + README; swift build clean (0 warnings), swift test 36/36 passed (exit 0)","ts":"2026-07-02T14:11:41Z"}
+{"team":1,"event":"done","what":"phase A: AI terminals full spec","ts":"2026-07-02T14:12:54Z"}
+{"team":1,"event":"done","what":"phase B: CLI bridge + managed registry","ts":"2026-07-02T14:12:54Z"}
+{"team":1,"event":"done","what":"phase C: rebrand copy in folder.mjs","ts":"2026-07-02T14:12:54Z"}
+{"team":1,"event":"done","what":"phase D: test suite (63 tests)","ts":"2026-07-02T14:12:54Z"}

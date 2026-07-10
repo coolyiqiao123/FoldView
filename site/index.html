@@ -3,13 +3,13 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>pm — a terminal dashboard for your local projects</title>
-<meta name="description" content="pm is a zero-dependency terminal dashboard that finds every local project, shows its size, lines of code, git status and live localhost ports — and opens or runs it with a single key." />
+<title>Foldview — your projects and AI coding tools, ready in one terminal.</title>
+<meta name="description" content="Foldview is a friendly, local-first terminal home for projects, local apps, and AI coding agents. Find what you're working on, see what's running, and open Claude, Codex, or any AI CLI in tiled Terminal windows." />
 <meta name="theme-color" content="#070B16" />
 <meta property="og:type" content="website" />
-<meta property="og:title" content="pm — a terminal dashboard for your local projects" />
-<meta property="og:description" content="Find, open, and run every project on your machine from one terminal dashboard. Zero dependencies. One command: npm i -g lazyproj" />
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'><rect width='36' height='36' rx='10' fill='%238FD3FF'/><path d='M11 13l5 5-5 5' fill='none' stroke='%23071019' stroke-width='2.8' stroke-linecap='round' stroke-linejoin='round'/><line x1='19' y1='23' x2='25' y2='23' stroke='%23071019' stroke-width='2.8' stroke-linecap='round'/></svg>" />
+<meta property="og:title" content="Foldview — your projects and AI coding tools, ready in one terminal." />
+<meta property="og:description" content="A friendly terminal home for projects, local apps, and AI coding agents. Local-first — no cloud sync, no accounts. npm i -g folderpreview" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 36 36'><rect width='36' height='36' rx='10' fill='%238FD3FF'/><path d='M18 29.6C16.1 27.7 15.7 26.2 16.3 24.9C16.8 25.9 17.3 26.2 18 26.2C18.7 26.2 19.2 25.9 19.7 24.9C20.3 26.2 19.9 27.7 18 29.6Z' fill='%23FBBF24'/><path d='M18 6.4C20.6 9 21.9 12.6 21.9 16.2V21.4C21.9 23.5 20.2 25.2 18 25.2C15.8 25.2 14.1 23.5 14.1 21.4V16.2C14.1 12.6 15.4 9 18 6.4Z' fill='%2306101f'/><path d='M14.1 18.6L10.2 24.8L14.1 23.6Z' fill='%2306101f'/><path d='M21.9 18.6L25.8 24.8L21.9 23.6Z' fill='%2306101f'/><circle cx='18' cy='14.4' r='2.5' fill='%23E9F5FF'/></svg>" />
 <link rel="preconnect" href="https://fonts.googleapis.com" />
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
@@ -24,13 +24,16 @@
     --radius:18px; --radius-sm:12px;
     --shadow:0 18px 50px -12px rgba(0,0,0,.6);
     --glow:0 0 60px -8px rgba(110,168,255,.35);
+    --lg-blur:16px; --lg-sat:180%;
+    --lg-tint:linear-gradient(160deg,rgba(255,255,255,.10),rgba(255,255,255,.025));
+    --lg-hi:rgba(255,255,255,.5); --lg-edge:rgba(255,255,255,.16);
     --maxw:1180px;
     --sans:"Inter",system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
     --display:"Space Grotesk",var(--sans);
     --mono:"JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
   }
   *,*::before,*::after{box-sizing:border-box}
-  html{scroll-behavior:smooth}
+  html{scroll-behavior:smooth; scroll-padding-top:88px}
   body{
     margin:0; background:var(--bg); color:var(--text);
     font-family:var(--sans); font-size:16px; line-height:1.6;
@@ -61,6 +64,108 @@
     -webkit-mask-image:radial-gradient(circle at 50% -10%, #000, transparent 72%);
             mask-image:radial-gradient(circle at 50% -10%, #000, transparent 72%);
   }
+  /* cursor-lit grid — same 64px lines in blue, revealed only around the pointer */
+  .grid-glow{
+    position:fixed; inset:0; z-index:-1; pointer-events:none; opacity:0;
+    transition:opacity .3s ease;
+    background-image:
+      linear-gradient(rgba(143,211,255,.24) 1px,transparent 1px),
+      linear-gradient(90deg,rgba(143,211,255,.24) 1px,transparent 1px);
+    background-size:64px 64px;
+    -webkit-mask-image:radial-gradient(circle 130px at var(--gx,-400px) var(--gy,-400px), #000 0%, rgba(0,0,0,.4) 52%, transparent 74%);
+            mask-image:radial-gradient(circle 130px at var(--gx,-400px) var(--gy,-400px), #000 0%, rgba(0,0,0,.4) 52%, transparent 74%);
+  }
+  .grid-glow.on{opacity:1}
+
+  /* ---------- night garden (liquid-glass showcase backdrop) ---------- */
+  /* A moonlit garden pinned behind the page: blossom bokeh, swaying foliage, fireflies and
+     luminous butterflies. Everything lives at z<0 with pointer-events:none — the frosted
+     panels blur + refract whatever flutters beneath them, which is the whole point. */
+  .garden{position:fixed; inset:0; z-index:-1; pointer-events:none; overflow:hidden}
+  /* out-of-focus blossoms drifting in the dark */
+  .garden .bk{
+    position:absolute; left:var(--x); top:var(--y); width:var(--dia); height:var(--dia);
+    border-radius:50%;
+    background:radial-gradient(circle at 34% 34%, var(--c), transparent 70%);
+    animation:bk-drift var(--t,32s) ease-in-out infinite alternate;
+  }
+  @keyframes bk-drift{to{transform:translate3d(28px,-20px,0) scale(1.09)}}
+  /* foliage silhouettes anchored to the bottom corners */
+  .flora{position:absolute; bottom:-4px; opacity:.85}
+  .flora-l{left:-16px; width:min(34vw,470px)}
+  .flora-r{right:-20px; width:min(30vw,430px)}
+  .flora .sway{transform-origin:50% 100%; animation:sway 9.5s ease-in-out infinite alternate}
+  .flora .s2{animation-duration:12s; animation-delay:-3s}
+  .flora .s3{animation-duration:8s; animation-delay:-5s}
+  @keyframes sway{from{transform:rotate(-.7deg)}to{transform:rotate(.9deg)}}
+  /* moonflowers glowing in the foliage */
+  .bloom{
+    position:absolute; width:7px; height:7px; border-radius:50%; background:rgb(var(--bc));
+    box-shadow:0 0 4px 1px rgba(var(--bc),.8), 0 0 18px 6px rgba(var(--bc),.4);
+    animation:bloom-breathe var(--t,6s) ease-in-out infinite alternate;
+  }
+  @keyframes bloom-breathe{from{opacity:.5}to{opacity:1}}
+  /* fireflies */
+  .ff{
+    position:absolute; width:3px; height:3px; border-radius:50%; background:rgb(var(--fc));
+    box-shadow:0 0 10px 3px rgba(var(--fc),.55);
+    animation:ff-a var(--t,10s) ease-in-out infinite alternate, ff-tw var(--tw,3s) ease-in-out infinite;
+  }
+  .ff:nth-child(even){animation-name:ff-b,ff-tw}
+  @keyframes ff-a{to{transform:translate3d(30px,-38px,0)}}
+  @keyframes ff-b{to{transform:translate3d(-34px,-22px,0)}}
+  @keyframes ff-tw{0%,100%{opacity:.12}55%{opacity:1}}
+  /* butterflies — cloned from #bfly-template by JS. Flight is an offset-path lap around a
+     closed loop whose seam is parked offscreen; the flap is a 3d wing rotation under a
+     rotateX tilt: two quick beats, then a long open-winged glide. */
+  .bflies{position:absolute; inset:0}
+  .bfly{
+    position:absolute; left:0; top:0; opacity:var(--o,1);
+    offset-path:var(--path); offset-rotate:auto 90deg; offset-distance:var(--od,0%);
+    animation:bfly-fly var(--fly,80s) linear infinite;
+    filter:blur(var(--bl,0px)) drop-shadow(0 0 9px var(--wglow,rgba(143,211,255,.5)));
+    perspective:520px;
+  }
+  @keyframes bfly-fly{from{offset-distance:0%}to{offset-distance:100%}}
+  .bfly-inner{
+    position:relative; width:120px; height:120px; margin:-60px 0 0 -60px;
+    transform-style:preserve-3d; scale:var(--s,1);
+    animation:bfly-bob var(--flap,2.4s) ease-in-out infinite;
+  }
+  /* the body dips on each wingbeat, then lifts into the glide */
+  @keyframes bfly-bob{
+    0%,24%,100%{transform:rotateX(54deg)}
+    12%,36%{transform:rotateX(54deg) translateY(5px)}
+    55%{transform:rotateX(48deg) translateY(-4px)}
+    80%{transform:rotateX(53deg) translateY(-1px)}
+  }
+  .wing{position:absolute; left:60px; top:25px; width:54px; height:70px; transform-origin:0% 50%; will-change:transform}
+  .wing svg{display:block; width:100%; height:100%; overflow:visible}
+  .wing-r{animation:bfly-flap-r var(--flap,2.4s) ease-in-out infinite}
+  .wing-l{animation:bfly-flap-l var(--flap,2.4s) ease-in-out infinite}
+  @keyframes bfly-flap-r{
+    0%{transform:rotateY(14deg)} 12%{transform:rotateY(-72deg)} 24%{transform:rotateY(12deg)}
+    36%{transform:rotateY(-72deg)} 50%{transform:rotateY(6deg)} 66%{transform:rotateY(-26deg)}
+    84%{transform:rotateY(2deg)} 100%{transform:rotateY(14deg)}
+  }
+  @keyframes bfly-flap-l{
+    0%{transform:scaleX(-1) rotateY(14deg)} 12%{transform:scaleX(-1) rotateY(-72deg)} 24%{transform:scaleX(-1) rotateY(12deg)}
+    36%{transform:scaleX(-1) rotateY(-72deg)} 50%{transform:scaleX(-1) rotateY(6deg)} 66%{transform:scaleX(-1) rotateY(-26deg)}
+    84%{transform:scaleX(-1) rotateY(2deg)} 100%{transform:scaleX(-1) rotateY(14deg)}
+  }
+  .bfly-body{position:absolute; left:60px; top:60px; width:40px; height:72px; margin:-36px 0 0 -20px; z-index:2}
+  /* wing colourways — the brand palette, so the glass refracts foldview's own hues */
+  .bfly.v1 .wing svg{fill:url(#wg-1)} .bfly.v1{--wglow:rgba(143,211,255,.55)}
+  .bfly.v2 .wing svg{fill:url(#wg-2)} .bfly.v2{--wglow:rgba(183,156,255,.5)}
+  .bfly.v3 .wing svg{fill:url(#wg-3)} .bfly.v3{--wglow:rgba(110,231,214,.5)}
+  .bfly.v4 .wing svg{fill:url(#wg-4)} .bfly.v4{--wglow:rgba(251,191,36,.45)}
+  /* flight paths are authored in a 1600×1000 field — compress the flock on small screens */
+  @media(max-width:760px){ .bflies{transform:scale(.62); transform-origin:0 0} .flora{opacity:.7} }
+  /* no offset-path support → park each butterfly at its home spot and let it hover */
+  @supports not (offset-path: path("M0 0 H1")){
+    .bfly{left:var(--fx,50%); top:var(--fy,50%); animation:bfly-hover 7s ease-in-out infinite alternate}
+    @keyframes bfly-hover{from{transform:translate(-10px,6px) rotate(-4deg)}to{transform:translate(12px,-8px) rotate(5deg)}}
+  }
 
   /* ---------- layout ---------- */
   .wrap{max-width:var(--maxw); margin-inline:auto; padding-inline:24px}
@@ -82,12 +187,24 @@
   }
 
   /* ---------- nav ---------- */
+  /* fixed, transparent shell — just positions the floating pill and animates it in/out */
   .nav{
-    position:sticky; top:0; z-index:50;
-    backdrop-filter:saturate(160%) blur(14px); -webkit-backdrop-filter:saturate(160%) blur(14px);
-    background:rgba(7,11,22,.62); border-bottom:1px solid var(--border);
+    position:fixed; top:0; left:0; right:0; z-index:50;
+    padding:14px 20px 0;                 /* float clear of the top edge + screen sides */
+    pointer-events:none;                 /* the transparent gutters never block clicks… */
+    transition:transform .45s cubic-bezier(.16,1,.3,1); will-change:transform;
   }
-  .nav-in{display:flex; align-items:center; gap:18px; height:62px}
+  .nav.nav--hidden{ transform:translateY(-135%) }    /* slide fully out of view on scroll-down */
+  /* the visible bar: a rounded rectangle floating over the page */
+  .nav-in{
+    display:flex; align-items:center; gap:18px; height:58px;
+    padding-inline:18px;                 /* pill's inner padding (overrides .wrap's 24px) */
+    border-radius:16px;                  /* rounded on all four sides */
+    background:rgba(7,11,22,.62); border:1px solid var(--border);
+    -webkit-backdrop-filter:saturate(160%) blur(14px); backdrop-filter:saturate(160%) blur(14px);
+    box-shadow:0 10px 30px -14px rgba(0,0,0,.55);
+    pointer-events:auto;                 /* …but the pill itself is interactive */
+  }
   .brand{display:flex; align-items:center; gap:11px; font-family:var(--display); font-weight:700; font-size:19px; letter-spacing:-.01em}
   .brand .logo{width:30px; height:30px; filter:drop-shadow(0 4px 12px rgba(110,168,255,.4))}
   .brand .alias{font-family:var(--mono); font-weight:400; font-size:12px; color:var(--faint)}
@@ -129,9 +246,9 @@
     padding:15px 16px 15px 20px; border-radius:14px; max-width:100%;
     background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.02));
     border:1px solid var(--border-2); box-shadow:var(--shadow);
-    transition:border-color .2s, transform .2s;
+    transition:border-color .2s, transform .2s, translate .2s, scale .2s;
   }
-  .cmd:hover{border-color:var(--brand); transform:translateY(-1px)}
+  .cmd:hover{border-color:var(--brand); translate:0 -1px; scale:1.02}
   .cmd .dollar{color:var(--brand); font-family:var(--mono); font-weight:700}
   .cmd code{
     font-family:var(--mono); font-size:clamp(14px,2.1vw,16px); color:var(--text);
@@ -152,7 +269,7 @@
 
   /* ---------- hero ---------- */
   .hero{padding:64px 0 28px}
-  .hero-grid{display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1.08fr); gap:54px; align-items:center}
+  .hero-grid{display:grid; grid-template-columns:minmax(0,.95fr) minmax(0,1.12fr); gap:54px; align-items:center}
   .badge{
     display:inline-flex; align-items:center; gap:9px; font-size:13px; color:var(--muted);
     background:var(--surface); border:1px solid var(--border); border-radius:999px; padding:6px 14px 6px 10px;
@@ -194,7 +311,7 @@
   .launch-menu .chip{font-family:var(--mono); font-weight:700; font-size:12.5px; color:var(--brand); background:var(--surface-2); border:1px solid var(--border-2); border-radius:8px; padding:5px 10px}
   .launch-menu .lm-hint{margin-left:auto; font-size:12px; color:var(--faint); font-family:var(--mono); white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
   @media(max-width:560px){ .launch-menu .lm-hint{display:none} }
-  .term-body{display:grid; grid-template-columns:minmax(0,.92fr) minmax(0,1.08fr); gap:0; font-size:13px; min-height:300px}
+  .term-body{display:grid; grid-template-columns:minmax(0,.86fr) minmax(0,1.14fr); gap:0; font-size:13px; min-height:300px}
   .term-list{border-right:1px solid var(--border); padding:10px 8px}
   .term-list .lhead{font-size:11px; color:var(--faint); padding:4px 10px 9px}
   .row{display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:8px; cursor:default; transition:background .25s}
@@ -208,8 +325,10 @@
   .d-title{font-family:var(--display); font-size:16px; color:var(--text)}
   .d-path{color:var(--faint); font-size:12px; margin-top:1px}
   .d-sep{height:1px; background:var(--border); margin:11px 0}
-  .d-live{display:flex; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); margin-bottom:12px}
-  .d-live .dot{width:8px; height:8px; border-radius:50%}
+  .d-live{display:flex; flex-wrap:wrap; align-items:center; column-gap:10px; row-gap:3px; font-size:12px; color:var(--muted); margin-bottom:12px; line-height:1.7}
+  .d-live .d-stat{white-space:nowrap}
+  .d-live .d-act{white-space:nowrap; color:var(--faint)}
+  .d-live .dot{display:inline-block; width:8px; height:8px; border-radius:50%; vertical-align:middle; margin-right:7px}
   .d-live .dot.on{background:var(--green); box-shadow:0 0 10px var(--green)}
   .d-live .dot.off{background:var(--faint)}
   .d-live .on-t{color:var(--green)} .d-live .off-t{color:var(--faint)}
@@ -225,8 +344,6 @@
   .lang .bar i{display:block; height:100%; border-radius:4px; background:linear-gradient(90deg,var(--brand),var(--violet)); transition:width .7s cubic-bezier(.4,0,.2,1)}
   .lang .pc{text-align:right; color:var(--faint)}
   .term-foot{border-top:1px solid var(--border); padding:9px 16px; font-size:11.5px; color:var(--faint); display:flex; align-items:center; gap:6px}
-  .cursor{display:inline-block; width:7px; height:14px; background:var(--brand); margin-left:2px; animation:blink 1.1s step-end infinite; vertical-align:-2px}
-  @keyframes blink{50%{opacity:0}}
   @media(max-width:560px){
     .term-body{grid-template-columns:1fr}
     .term-list{border-right:none; border-bottom:1px solid var(--border)}
@@ -240,6 +357,36 @@
   .stat .n{font-family:var(--display); font-weight:700; font-size:30px; letter-spacing:-.02em; background:linear-gradient(120deg,var(--brand),var(--cyan)); -webkit-background-clip:text; background-clip:text; color:transparent}
   .stat .l{color:var(--muted); font-size:13px; margin-top:4px}
   @media(max-width:640px){ .strip-in{grid-template-columns:1fr 1fr} }
+  /* ---------- "type view" run demo ---------- */
+  .run-demo{max-width:880px; margin-inline:auto; text-align:center}
+  .run-head h3{font-family:var(--display); font-weight:700; font-size:clamp(22px,3vw,30px); letter-spacing:-.02em; line-height:1.12; margin:0}
+  .run-head h3 code{font-family:var(--mono); color:var(--brand); font-size:.82em; background:rgba(143,211,255,.1); padding:2px 9px; border-radius:8px}
+  .run-head .run-tag{color:var(--muted); margin:12px 0 22px; font-family:var(--mono); font-size:13.5px}
+  .run-head .run-tag b{color:var(--green); font-weight:700}
+  .run-term{position:relative; text-align:left; background:#04060c; border:1px solid var(--border-2); border-radius:14px; overflow:hidden; box-shadow:var(--shadow), var(--glow); font-family:var(--mono)}
+  .run-term::after{content:""; position:absolute; inset:0; border-radius:14px; pointer-events:none; box-shadow:inset 0 1px 0 rgba(255,255,255,.06)}
+  .run-bar{display:flex; align-items:center; gap:7px; padding:11px 14px; background:rgba(255,255,255,.03); border-bottom:1px solid var(--border)}
+  .run-bar .tl{width:11px; height:11px; border-radius:50%}
+  .run-bar .run-title{margin-left:10px; font-size:12px; color:var(--faint); letter-spacing:.02em}
+  .run-body{padding:16px 18px 18px}
+  .run-line{white-space:nowrap; font-size:13.5px}
+  .run-path{color:var(--brand)}
+  .run-prompt{color:var(--green); font-weight:700; margin:0 9px}
+  .run-cmd{color:var(--text)}
+  .run-caret{display:inline-block; width:8px; height:1.05em; background:var(--brand); vertical-align:-3px; margin-left:2px; animation:run-caret 1s step-end infinite}
+  @keyframes run-caret{50%{opacity:0}}
+  .run-screen{margin:12px 0 0; font-family:var(--mono); font-size:clamp(8.5px,1.16vw,13px); line-height:1.5; white-space:pre; overflow:hidden; min-height:300px; color:var(--text)}
+  .run-screen .bd{color:#3a5170}
+  .run-screen .b{color:var(--brand)}
+  .run-screen .g{color:var(--green)}
+  .run-screen .r{color:var(--red)}
+  .run-screen .w{color:var(--text)}
+  .run-screen .d{color:var(--faint)}
+  .run-screen .sel{color:var(--brand); font-weight:700}
+  .run-screen .bar{color:var(--brand)}
+  .run-screen .chip{color:var(--brand); font-weight:700}
+  .run-screen .selrow{background:rgba(143,211,255,.10); border-radius:3px}
+  @media(max-width:560px){ .run-screen{font-size:7px} }
 
   /* ---------- section shell ---------- */
   .block{padding:84px 0}
@@ -256,7 +403,7 @@
     background:linear-gradient(140deg,rgba(143,211,255,.5),transparent 40%); opacity:0;
     -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0); -webkit-mask-composite:xor; mask-composite:exclude;
     transition:opacity .3s}
-  .card:hover{transform:translateY(-4px); background:var(--surface-2); border-color:var(--border-2)}
+  .card:hover{translate:0 -4px; scale:1.03; background:var(--surface-2); border-color:var(--border-2)}
   .card:hover::before{opacity:1}
   .card .ic{width:42px; height:42px; border-radius:11px; display:grid; place-items:center; margin-bottom:16px;
     background:linear-gradient(135deg,rgba(143,211,255,.16),rgba(183,156,255,.12)); border:1px solid var(--border-2); color:var(--brand)}
@@ -320,7 +467,17 @@
     background:radial-gradient(50% 100% at 50% 0,rgba(143,211,255,.3),transparent 70%); pointer-events:none}
   .finale h2{font-family:var(--display); font-weight:700; font-size:clamp(28px,4.6vw,46px); letter-spacing:-.02em; margin:0; position:relative}
   .finale p{color:var(--muted); margin:14px auto 30px; max-width:48ch; position:relative}
-  .finale .cta-row{display:flex; flex-wrap:wrap; gap:14px; justify-content:center; position:relative}
+  .finale .cta-row{
+    display:grid; grid-template-columns:1fr 1fr; gap:14px;
+    max-width:680px; margin-inline:auto; position:relative;
+  }
+  /* symmetry — install-command box + Star-on-GitHub button share one EXACT footprint at every width (incl. stacked) */
+  .finale .cta-row .cmd,
+  .finale .cta-row .btn{width:100%; height:68px; box-sizing:border-box; border-radius:14px; align-items:center}
+  .finale .cta-row .cmd{display:flex}
+  .finale .cta-row .btn{justify-content:center}
+  .finale .cta-row .btn-ghost{border-color:var(--border-2)}
+  @media(max-width:560px){ .finale .cta-row{grid-template-columns:1fr; max-width:420px} }
 
   /* ---------- footer ---------- */
   footer{border-top:1px solid var(--border); padding:48px 0 64px; background:rgba(0,0,0,.18)}
@@ -336,15 +493,100 @@
   .foot-bottom{margin-top:42px; padding-top:22px; border-top:1px solid var(--border); display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; color:var(--faint); font-size:13px}
   .foot-bottom .mono{font-family:var(--mono)}
 
-  /* ---------- reveal ---------- */
-  [data-reveal]{opacity:0; transform:translateY(22px); transition:opacity .7s cubic-bezier(.16,1,.3,1), transform .7s cubic-bezier(.16,1,.3,1); transition-delay:var(--d,0ms)}
-  [data-reveal].in{opacity:1; transform:none}
+  /* ---------- liquid glass ---------- */
+  .lg-svg{position:absolute; width:0; height:0; overflow:hidden; pointer-events:none}
+  /* .glass is applied via JS to nav / install pill / cards / steps / stats / finale */
+  .glass{
+    position:relative; isolation:isolate;
+    background:var(--lg-tint);
+    -webkit-backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(1.04);
+            backdrop-filter:blur(var(--lg-blur)) saturate(var(--lg-sat)) brightness(1.04);
+    border:1px solid var(--lg-edge);
+    box-shadow:
+      var(--shadow),
+      inset 0 1px 0 var(--lg-hi),                       /* crisp top specular — the liquid-glass edge light */
+      inset 0 0 0 1px rgba(255,255,255,.05),
+      inset 0 -26px 48px -34px rgba(120,180,255,.55);   /* soft light pooling at the base */
+  }
+  /* pointer-tracked specular highlight — light catching the surface as you move over it */
+  .lg-sheen{
+    position:absolute; inset:0; border-radius:inherit; z-index:3; pointer-events:none;
+    opacity:0; transition:opacity .4s ease; mix-blend-mode:screen;
+    background:radial-gradient(200px 200px at var(--mx,50%) var(--my,0%),
+              rgba(255,255,255,.30), rgba(180,214,255,.10) 42%, transparent 70%);
+  }
+  .glass:hover .lg-sheen{opacity:1}
+  /* refraction layer — an SVG turbulence/displacement map warps the frosted mesh behind the signature pill */
+  .lg-refract{
+    position:absolute; inset:-2px; border-radius:inherit; z-index:-1; pointer-events:none;
+    -webkit-backdrop-filter:blur(2px); backdrop-filter:blur(2px);
+    -webkit-filter:url(#lg-distort); filter:url(#lg-distort);
+  }
+  /* nav pill — frosted, tuned darker so links stay legible over the mesh (radius comes from .nav-in) */
+  .nav-in.glass{
+    background:linear-gradient(180deg,rgba(18,28,52,.62),rgba(10,16,32,.42));
+    border:1px solid var(--lg-edge);
+    box-shadow:inset 0 1px 0 var(--lg-hi), 0 12px 34px -16px rgba(0,0,0,.6);
+  }
+  /* the install pill is the signature — brighter tint reads as thicker, more liquid glass */
+  .cmd.glass{background:linear-gradient(165deg,rgba(255,255,255,.13),rgba(255,255,255,.03))}
+  @media(prefers-reduced-motion:reduce){ .lg-sheen{display:none} }
+
+  /* ---------- reveal (float + appear on scroll) ---------- */
+  [data-reveal]{
+    opacity:0; transform:translateY(38px) scale(.965); filter:blur(7px);
+    transition:opacity .85s cubic-bezier(.16,1,.3,1), transform .85s cubic-bezier(.16,1,.3,1), filter .85s cubic-bezier(.16,1,.3,1);
+    transition-delay:var(--d,0ms); will-change:opacity,transform,filter;
+  }
+  [data-reveal].in{opacity:1; transform:none; filter:none}
+  /* bubbles: keep the reveal entry transition, but hover grow/lift runs fast with no reveal delay
+     (translate/scale are independent props, so the reveal's transform:none can't cancel them) */
+  .card[data-reveal], .step[data-reveal], .finale-in[data-reveal]{
+    transition:opacity .85s cubic-bezier(.16,1,.3,1), transform .85s cubic-bezier(.16,1,.3,1), filter .85s cubic-bezier(.16,1,.3,1),
+      translate .25s ease, scale .25s ease, background .3s, border-color .3s;
+    transition-delay:var(--d,0ms), var(--d,0ms), var(--d,0ms), 0ms, 0ms, 0ms, 0ms;
+  }
+  .step:hover{translate:0 -4px; scale:1.03; border-color:var(--border-2)}
+  .finale-in:hover{scale:1.015}
+  /* when the real WebGL liquid glass (ybouane/liquidglass) mounts, <html> gets .lg-live —
+     drop the CSS-frost fallback so the two don't stack. The library paints the refraction;
+     the card's ::before gradient edge, text, and hover grow/lift all stay on top. */
+  .lg-live .glass{
+    -webkit-backdrop-filter:none; backdrop-filter:none;
+    background:transparent; box-shadow:none;
+  }
+  .lg-live .nav-in.glass, .lg-live .cmd.glass{background:transparent; border-color:transparent}
+  .lg-live .glass{border-color:transparent}
+  .lg-live .lg-sheen, .lg-live .lg-refract{display:none}
+
+  /* ---------- blue circle cursor ---------- */
+  @media (hover:hover) and (pointer:fine){
+    html.has-cursor, html.has-cursor *{cursor:none !important}
+    .cursor-dot,.cursor-ring{position:fixed; top:0; left:0; z-index:9999; pointer-events:none; border-radius:50%; mix-blend-mode:normal}
+    .cursor-dot{
+      width:14px; height:14px; margin:-7px 0 0 -7px;
+      background:var(--brand); box-shadow:0 0 14px 2px rgba(143,211,255,.85);
+      transition:width .2s ease, height .2s ease, margin .2s ease, background .2s, opacity .2s;
+    }
+    .cursor-dot.hover{width:22px; height:22px; margin:-11px 0 0 -11px; background:#B9E2FF}
+    .cursor-dot.down{width:10px; height:10px; margin:-5px 0 0 -5px}
+    .cursor-ring{display:none !important}
+    /* flashlight — softly lights up words under the cursor */
+    .cursor-glow{
+      position:fixed; top:0; left:0; z-index:9998; pointer-events:none;
+      width:190px; height:190px; margin:-95px 0 0 -95px; border-radius:50%;
+      background:radial-gradient(circle, rgba(196,232,255,.16), rgba(143,211,255,.05) 44%, transparent 68%);
+      mix-blend-mode:screen; opacity:0; transition:opacity .3s ease;
+    }
+    .cursor-glow.on{opacity:1}
+    .cursor-hide{opacity:0 !important}
+  }
 
   :focus-visible{outline:2px solid var(--brand); outline-offset:3px; border-radius:6px}
 
   @media(prefers-reduced-motion:reduce){
     *{animation:none !important; transition:none !important; scroll-behavior:auto !important}
-    [data-reveal]{opacity:1; transform:none}
+    [data-reveal]{opacity:1; transform:none; filter:none}
   }
 </style>
 </head>
@@ -352,17 +594,97 @@
 <div class="mesh" aria-hidden="true"></div>
 <div class="grid-ovl" aria-hidden="true"></div>
 
+<!-- ===================== NIGHT GARDEN =====================
+     The liquid-glass showcase backdrop: a moonlit garden with drifting blossom bokeh, swaying
+     foliage, fireflies and luminous butterflies that flap their wings while lapping closed
+     flight loops. It all sits behind the content, so every frosted panel blurs and refracts
+     live motion — scroll, and the glass sweeps over the garden. -->
+<div class="garden" aria-hidden="true">
+  <span class="bloom" style="left:5.5%; bottom:19%; --bc:196,232,255; --t:6.5s"></span>
+  <span class="bloom" style="left:18%;  bottom:8%;  --bc:251,191,36;  --t:5.2s"></span>
+  <span class="bloom" style="right:7%;  bottom:15%; --bc:183,156,255; --t:7.4s"></span>
+
+  <div class="fireflies">
+    <span class="ff" style="left:8%;  bottom:11%; --fc:110,231,214; --t:9s;  --tw:3.1s"></span>
+    <span class="ff" style="left:22%; bottom:24%; --fc:110,231,214; --t:12s; --tw:2.6s"></span>
+    <span class="ff" style="left:38%; bottom:7%;  --fc:251,191,36;  --t:10s; --tw:3.7s"></span>
+    <span class="ff" style="right:26%; bottom:18%; --fc:110,231,214; --t:13s; --tw:2.9s"></span>
+    <span class="ff" style="right:12%; bottom:9%;  --fc:251,191,36;  --t:8s;  --tw:3.4s"></span>
+    <span class="ff" style="right:5%;  bottom:26%; --fc:110,231,214; --t:11s; --tw:2.4s"></span>
+  </div>
+
+  <div class="bflies" id="bflies"><!-- butterflies cloned from #bfly-template by JS --></div>
+</div>
+
+<!-- shared butterfly artwork — wing + body geometry, and the four wing colourways -->
+<svg class="lg-svg" aria-hidden="true" focusable="false">
+  <defs>
+    <radialGradient id="wg-1" cx="6%" cy="50%" r="115%">
+      <stop offset="0" stop-color="#0E2A52"/><stop offset=".42" stop-color="#6EA8FF"/>
+      <stop offset=".78" stop-color="#8FD3FF"/><stop offset="1" stop-color="#E9F5FF"/>
+    </radialGradient>
+    <radialGradient id="wg-2" cx="6%" cy="50%" r="115%">
+      <stop offset="0" stop-color="#241C4E"/><stop offset=".42" stop-color="#8F72E8"/>
+      <stop offset=".78" stop-color="#B79CFF"/><stop offset="1" stop-color="#F0E8FF"/>
+    </radialGradient>
+    <radialGradient id="wg-3" cx="6%" cy="50%" r="115%">
+      <stop offset="0" stop-color="#0C3634"/><stop offset=".42" stop-color="#3BC4B0"/>
+      <stop offset=".78" stop-color="#6EE7D6"/><stop offset="1" stop-color="#E4FFF9"/>
+    </radialGradient>
+    <radialGradient id="wg-4" cx="6%" cy="50%" r="115%">
+      <stop offset="0" stop-color="#4A2E08"/><stop offset=".42" stop-color="#E3A11B"/>
+      <stop offset=".78" stop-color="#FBBF24"/><stop offset="1" stop-color="#FFF3D6"/>
+    </radialGradient>
+    <g id="bfly-wing">
+      <path d="M2 62 C6 34 22 10 48 4 C74 -1 96 12 97 30 C98 48 82 62 58 66 C38 69 14 68 2 62 Z" stroke="rgba(255,255,255,.30)" stroke-width="1"/>
+      <path d="M3 70 C20 68 44 72 56 84 C68 96 64 114 50 121 C36 128 16 118 8 100 C4 90 2 78 3 70 Z" stroke="rgba(255,255,255,.24)" stroke-width="1"/>
+      <path d="M6 60 C30 50 52 38 78 22 M6 66 C28 65 46 62 64 56 M7 72 C22 76 36 84 47 97" fill="none" stroke="rgba(255,255,255,.20)" stroke-width="1.1"/>
+      <circle cx="80" cy="26" r="3.4" fill="rgba(255,255,255,.55)"/>
+      <circle cx="68" cy="40" r="2" fill="rgba(255,255,255,.35)"/>
+    </g>
+    <g id="bfly-body">
+      <path d="M0 -16 C5 -13 5 22 0 27 C-5 22 -5 -13 0 -16 Z" fill="#0A1322" stroke="rgba(233,245,255,.35)" stroke-width="1"/>
+      <circle cx="0" cy="-21" r="4.4" fill="#0A1322" stroke="rgba(233,245,255,.35)" stroke-width="1"/>
+      <path d="M-2 -24 C-6 -31 -12 -35 -15 -32 M2 -24 C6 -31 12 -35 15 -32" fill="none" stroke="rgba(196,225,255,.75)" stroke-width="1.4" stroke-linecap="round"/>
+      <circle cx="-15" cy="-32" r="1.4" fill="rgba(196,225,255,.8)"/>
+      <circle cx="15" cy="-32" r="1.4" fill="rgba(196,225,255,.8)"/>
+    </g>
+  </defs>
+</svg>
+
+<template id="bfly-template">
+  <div class="bfly">
+    <div class="bfly-inner">
+      <div class="wing wing-l"><svg viewBox="0 0 100 130"><use href="#bfly-wing"/></svg></div>
+      <div class="wing wing-r"><svg viewBox="0 0 100 130"><use href="#bfly-wing"/></svg></div>
+      <svg class="bfly-body" viewBox="-20 -36 40 72"><use href="#bfly-body"/></svg>
+    </div>
+  </div>
+</template>
+
+<!-- liquid-glass refraction filter (turbulence -> displacement of the frosted backdrop) -->
+<svg class="lg-svg" aria-hidden="true" focusable="false">
+  <filter id="lg-distort" x="-25%" y="-25%" width="150%" height="150%" color-interpolation-filters="sRGB">
+    <feTurbulence type="fractalNoise" baseFrequency="0.009 0.012" numOctaves="2" seed="17" result="noise"/>
+    <feGaussianBlur in="noise" stdDeviation="1.3" result="soft"/>
+    <feDisplacementMap in="SourceGraphic" in2="soft" scale="44" xChannelSelector="R" yChannelSelector="G"/>
+  </filter>
+</svg>
+
 <!-- ===================== NAV ===================== -->
 <header class="nav">
   <div class="wrap nav-in">
-    <a class="brand" href="#top" aria-label="pm home">
+    <a class="brand" href="#top" aria-label="Foldview home">
       <svg class="logo" viewBox="0 0 36 36" aria-hidden="true">
         <rect width="36" height="36" rx="10" fill="url(#lg)"/>
-        <path d="M11 13l5 5-5 5" fill="none" stroke="#06101f" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
-        <line x1="19" y1="23" x2="25" y2="23" stroke="#06101f" stroke-width="2.7" stroke-linecap="round"/>
+        <path d="M18 29.6C16.1 27.7 15.7 26.2 16.3 24.9C16.8 25.9 17.3 26.2 18 26.2C18.7 26.2 19.2 25.9 19.7 24.9C20.3 26.2 19.9 27.7 18 29.6Z" fill="#FBBF24"/>
+        <path d="M18 6.4C20.6 9 21.9 12.6 21.9 16.2V21.4C21.9 23.5 20.2 25.2 18 25.2C15.8 25.2 14.1 23.5 14.1 21.4V16.2C14.1 12.6 15.4 9 18 6.4Z" fill="#06101f"/>
+        <path d="M14.1 18.6L10.2 24.8L14.1 23.6Z" fill="#06101f"/>
+        <path d="M21.9 18.6L25.8 24.8L21.9 23.6Z" fill="#06101f"/>
+        <circle cx="18" cy="14.4" r="2.5" fill="#E9F5FF"/>
         <defs><linearGradient id="lg" x1="0" y1="0" x2="36" y2="36"><stop offset="0" stop-color="#A8DCFF"/><stop offset="1" stop-color="#6EA8FF"/></linearGradient></defs>
       </svg>
-      pm <span class="alias">/ project&#8209;manager</span>
+      foldview <span class="alias">/ pm</span>
     </a>
     <nav class="nav-links">
       <a href="#features">Features</a>
@@ -381,16 +703,16 @@
 
 <main id="top">
   <!-- ===================== HERO ===================== -->
-  <section class="hero">
+  <section class="hero" id="start">
     <div class="wrap hero-grid">
       <div class="hero-text">
         <span class="badge"><span class="dot"></span> Zero dependencies · Node 18+ · MIT</span>
-        <h1>Preview any project with <span class="grad">one Enter key.</span></h1>
-        <p class="sub"><code>pm</code> is a terminal dashboard that finds every local project, shows its size, lines of code, git status and live localhost ports — then opens or runs it with a single key.</p>
+        <h1 class="grad">Your projects and AI coding tools, ready in one terminal.</h1>
+        <p class="sub"><b style="color:var(--text)">Foldview.</b> A friendly terminal home for projects, local apps, and AI coding agents. Open it and see what you're working on, what's already running, and how to start your next AI coding session. Local-first: project discovery, CLI detection, and configuration stay on your machine — no cloud sync, no accounts.</p>
         <div class="hero-cta">
-          <div class="cmd" data-copy="npm i -g lazyproj" role="button" tabindex="0" aria-label="Copy install command: npm i -g lazyproj">
+          <div class="cmd" data-copy="npm i -g folderpreview" role="button" tabindex="0" aria-label="Copy install command: npm i -g folderpreview">
             <span class="dollar">$</span>
-            <code>npm i -g lazyproj</code>
+            <code>npm i -g folderpreview</code>
             <span class="copy">
               <svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
               <svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -398,20 +720,22 @@
             </span>
           </div>
         </div>
-        <p class="hero-note">then <b>pm ~/Documents</b> — and you're in.</p>
+        <p class="hero-note">then <b>pm ~/Documents</b> — press <b>a</b> to open an AI terminal, or <b>↵</b> to launch a project.</p>
       </div>
 
       <div class="hero-visual">
-        <div class="term" role="img" aria-label="Animated preview of the pm terminal dashboard showing a list of projects with their ports, lines of code, git status and language breakdown">
+        <div class="term" role="img" aria-label="Animated preview of the foldview terminal dashboard showing a list of projects with their ports, lines of code, git status and language breakdown">
           <div class="term-bar">
             <span class="tl r"></span><span class="tl y"></span><span class="tl g"></span>
             <span class="term-title">pm · ~/Documents · 6 projects</span>
             <span class="term-ports">
               <span class="pill"><span class="dot"></span>3000</span>
+              <span class="pill"><span class="dot"></span>4321</span>
+              <span class="pill"><span class="dot"></span>5173</span>
             </span>
           </div>
           <div class="launch-menu">
-            <span class="chip">🚀 Launch</span>
+            <span class="chip">🚦 Launch</span>
             <span class="lm-hint">↵ launch — opens the site, starts the dev server if needed</span>
           </div>
           <div class="term-body">
@@ -421,21 +745,27 @@
             <div class="term-detail" id="termDetail"><!-- injected by JS --></div>
           </div>
           <div class="term-foot">
-            <span>↑↓ move · ↵ launch · d start · x stop · / find · ? help · q quit</span>
-            <span class="cursor" aria-hidden="true"></span>
+            <span>↑↓ move · ↵ launch · d start · x stop · a AI · / find · ? help · q quit</span>
           </div>
         </div>
       </div>
     </div>
   </section>
 
-  <!-- ===================== STATS STRIP ===================== -->
+  <!-- ===================== RUN IT ===================== -->
   <section class="wrap strip">
-    <div class="strip-in">
-      <div class="stat" data-reveal><div class="n">0</div><div class="l">dependencies</div></div>
-      <div class="stat" data-reveal><div class="n">1</div><div class="l">command · <span style="font-family:var(--mono)">pm</span></div></div>
-      <div class="stat" data-reveal><div class="n">100%</div><div class="l">local — no network</div></div>
-      <div class="stat" data-reveal><div class="n">3</div><div class="l">levels deep scanned</div></div>
+    <div class="run-demo" data-reveal>
+      <div class="run-head">
+        <h3>Just type <code>foldview</code> — and it runs.</h3>
+        <p class="run-tag"><b>100%</b> local — no network. No config, no setup.</p>
+      </div>
+      <div class="run-term" role="img" aria-label="Terminal animation: typing foldview, then the foldview dashboard launches">
+        <div class="run-bar"><span class="tl r"></span><span class="tl y"></span><span class="tl g"></span><span class="run-title">foldview — zsh</span></div>
+        <div class="run-body">
+          <div class="run-line"><span class="run-path">~/Documents</span><span class="run-prompt">❯</span><span class="run-cmd" id="runTyped"></span><span class="run-caret" id="runCaret"></span></div>
+          <pre class="run-screen" id="runScreen"></pre>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -443,10 +773,17 @@
   <section class="block wrap" id="features">
     <div class="block-head" data-reveal>
       <span class="eyebrow">Everything, at a glance</span>
-      <h2 class="title">A control panel for your <span class="grad">~/Documents</span></h2>
-      <p class="lead">Point <code style="font-family:var(--mono);color:var(--brand)">pm</code> at a folder and it scans up to three levels deep for anything with a <code style="font-family:var(--mono);color:var(--brand)">package.json</code>, <code style="font-family:var(--mono);color:var(--brand)">.git</code>, <code style="font-family:var(--mono);color:var(--brand)">Cargo.toml</code>, <code style="font-family:var(--mono);color:var(--brand)">go.mod</code> or <code style="font-family:var(--mono);color:var(--brand)">pyproject.toml</code>.</p>
+      <h2 class="title">A terminal home for your <span class="grad">projects and AI tools</span></h2>
+      <p class="lead">Point <code style="font-family:var(--mono);color:var(--brand)">pm</code> at a folder and Foldview finds every project — anything with a <code style="font-family:var(--mono);color:var(--brand)">package.json</code>, <code style="font-family:var(--mono);color:var(--brand)">.git</code>, <code style="font-family:var(--mono);color:var(--brand)">Cargo.toml</code>, <code style="font-family:var(--mono);color:var(--brand)">go.mod</code> or <code style="font-family:var(--mono);color:var(--brand)">pyproject.toml</code> — plus the AI coding CLIs and local apps already on your machine.</p>
     </div>
     <div class="bento">
+      <div class="card col-3 wide" data-reveal>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><line x1="12" y1="15" x2="17" y2="15"/></svg></div>
+        <div>
+          <h3>AI terminals for the CLI you already have</h3>
+          <p>Select a project and press <code>a</code>. Foldview finds the AI coding CLIs already on your machine — Claude, Codex, Gemini, and more — or you can add your own. Pick one and how many windows, 1–9, and Foldview opens and tiles that many Terminal windows in the project: <code>opened 3 × claude</code>. macOS only for now; an optional macOS 14+ menu-bar companion for quick access is on the way.</p>
+        </div>
+      </div>
       <div class="card col-3 wide" data-reveal>
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg></div>
         <div>
@@ -454,17 +791,20 @@
           <p>Press <code>↵</code> and the project's site opens. If the dev server is down, <code>pm</code> starts it <b style="color:var(--text)">in the background</b> and opens the browser once it's up — the dashboard never closes. <code>x</code> stops a server <code>pm</code> started.</p>
         </div>
       </div>
-      <div class="card col-3 wide" data-reveal>
+      <div class="card col-2" data-reveal>
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3" fill="currentColor" stroke="none"/></svg></div>
-        <div>
-          <h3>Launchable projects float to the top</h3>
-          <p>Anything with a dev or start script rises to the top — tagged <span style="color:var(--green)">●&nbsp;live</span> or <span style="color:var(--green)">○&nbsp;stopped</span>. Projects with no server sink below with a <span style="color:var(--red)">●&nbsp;red dot</span>, so what you can actually run is always in reach.</p>
-        </div>
+        <h3>Launchable projects rise to the top</h3>
+        <p>Anything with a dev or start script is tagged <span style="color:var(--green)">●&nbsp;live</span> or <span style="color:var(--green)">○&nbsp;stopped</span> and sorts first. Everything else sinks below with a <span style="color:var(--red)">●&nbsp;red dot</span>.</p>
+      </div>
+      <div class="card col-2" data-reveal>
+        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg></div>
+        <h3>Local apps, not just projects</h3>
+        <p>Foldview also lists local web apps next to your projects — tools it detects when installed, like <code>claude-mem</code>, any live localhost server it discovers, and anything you pin yourself. Saved to <code>~/.foldview.json</code>.</p>
       </div>
       <div class="card col-2" data-reveal>
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div>
         <h3>Real lines of code</h3>
-        <p>Counts source only — skips <code>node_modules</code>, <code>dist</code>, <code>build</code>, <code>.next</code>, lockfiles and minified output.</p>
+        <p>Counts source only — skips <code>node_modules</code>, <code>dist</code>, <code>build</code>, <code>.next</code>, lockfiles and minified output. Also measures disk and <code>node_modules</code> size with <code>du</code>, so you can spot what's taking up space.</p>
       </div>
       <div class="card col-2" data-reveal>
         <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.9 19.1a10 10 0 0 1 0-14.2M19.1 4.9a10 10 0 0 1 0 14.2M7.8 16.2a6 6 0 0 1 0-8.5M16.2 7.8a6 6 0 0 1 0 8.5"/></svg></div>
@@ -481,16 +821,6 @@
         <h3>Language breakdown</h3>
         <p>Per-language bars so you know what each project is actually made of.</p>
       </div>
-      <div class="card col-2" data-reveal>
-        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="14" width="20" height="6" rx="2"/><line x1="6" y1="17" x2="6.01" y2="17"/><line x1="10" y1="17" x2="10.01" y2="17"/><path d="M5 14l2.4-9A2 2 0 0 1 9.3 3.6h5.4A2 2 0 0 1 16.6 5L19 14"/></svg></div>
-        <h3>Size — disk + node_modules</h3>
-        <p>Measured fast with <code>du</code>, so you can spot the 300 MB <code>node_modules</code> you forgot about.</p>
-      </div>
-      <div class="card col-2" data-reveal>
-        <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2l8 4.5v9L12 20 4 15.5v-9L12 2z"/><path d="M12 11l8-4.5M12 11v9M12 11L4 6.5"/></svg></div>
-        <h3>Pure Node, one file</h3>
-        <p>No dependencies, no network calls — a single <code>.mjs</code> using <code>du</code> for speed and a quick TCP probe for ports.</p>
-      </div>
     </div>
   </section>
 
@@ -503,9 +833,9 @@
     <div class="steps">
       <div class="step" data-reveal>
         <h3>Install it globally</h3>
-        <p>One command. Brings the <code style="font-family:var(--mono);color:var(--brand)">pm</code> command (plus <code style="font-family:var(--mono);color:var(--brand)">lazyproj</code>, <code style="font-family:var(--mono);color:var(--brand)">project-manager</code> and <code style="font-family:var(--mono);color:var(--brand)">folder</code>) onto your PATH.</p>
-        <div class="codeline" data-copy="npm i -g lazyproj" role="button" tabindex="0" aria-label="Copy: npm i -g lazyproj">
-          <span class="dollar">$</span><span>npm i -g lazyproj</span>
+        <p>One command. Brings the <code style="font-family:var(--mono);color:var(--brand)">pm</code> command (plus <code style="font-family:var(--mono);color:var(--brand)">folderpreview</code>, <code style="font-family:var(--mono);color:var(--brand)">project-manager</code> and <code style="font-family:var(--mono);color:var(--brand)">foldview</code>) onto your PATH.</p>
+        <div class="codeline" data-copy="npm i -g folderpreview" role="button" tabindex="0" aria-label="Copy: npm i -g folderpreview">
+          <span class="dollar">$</span><span>npm i -g folderpreview</span>
           <span class="cb-copy kbd-inline"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg></span>
         </div>
       </div>
@@ -518,10 +848,10 @@
         </div>
       </div>
       <div class="step" data-reveal>
-        <h3>Navigate & open</h3>
-        <p>Move with the arrows and hit <code style="font-family:var(--mono);color:var(--brand)">↵</code> to launch — <code style="font-family:var(--mono);color:var(--brand)">pm</code> opens the site, starting the dev server first if it isn't already up.</p>
+        <h3>Navigate & launch</h3>
+        <p>Move with the arrows, hit <code style="font-family:var(--mono);color:var(--brand)">↵</code> to open a project's site, or press <code style="font-family:var(--mono);color:var(--brand)">a</code> to open it in an AI terminal instead.</p>
         <div class="codeline" style="gap:8px">
-          <kbd>↑</kbd><kbd>↓</kbd><span style="color:var(--faint)">·</span><kbd>↵</kbd>
+          <kbd>↑</kbd><kbd>↓</kbd><span style="color:var(--faint)">·</span><kbd>↵</kbd><span style="color:var(--faint)">·</span><kbd>a</kbd>
         </div>
       </div>
     </div>
@@ -532,14 +862,14 @@
     <div class="block-head" data-reveal>
       <span class="eyebrow">Muscle memory</span>
       <h2 class="title">Keyboard-driven, <span class="grad">all of it</span></h2>
-      <p class="lead">No mouse, no menus. Every action is a single keystroke.</p>
     </div>
     <div class="keys-grid" data-reveal>
       <div class="keyrow"><span class="ks"><kbd>↑</kbd><kbd>↓</kbd><kbd>j</kbd><kbd>k</kbd></span><span class="desc">Move up / down</span></div>
       <div class="keyrow"><span class="ks"><kbd>g</kbd><kbd>G</kbd></span><span class="desc">Jump to top / bottom</span></div>
-      <div class="keyrow"><span class="ks"><kbd>↵</kbd><kbd>l</kbd></span><span class="desc">🚀 Launch — open the site (starts the dev server if needed)</span></div>
+      <div class="keyrow"><span class="ks"><kbd>↵</kbd><kbd>l</kbd></span><span class="desc">🚦 Launch — open the site (starts the dev server if needed)</span></div>
       <div class="keyrow"><span class="ks"><kbd>d</kbd></span><span class="desc">Start the dev server in the background</span></div>
       <div class="keyrow"><span class="ks"><kbd>x</kbd></span><span class="desc">Stop a dev server pm started</span></div>
+      <div class="keyrow"><span class="ks"><kbd>a</kbd></span><span class="desc">AI terminals — open a detected or custom AI CLI in 1–9 tiled Terminal windows</span></div>
       <div class="keyrow"><span class="ks"><kbd>D</kbd></span><span class="desc">Run the dev server in the foreground</span></div>
       <div class="keyrow"><span class="ks"><kbd>o</kbd></span><span class="desc">Open localhost without starting it</span></div>
       <div class="keyrow"><span class="ks"><kbd>e</kbd></span><span class="desc">Open in <code style="font-family:var(--mono);color:var(--brand)">$EDITOR</code> (default <code style="font-family:var(--mono);color:var(--brand)">code</code>)</span></div>
@@ -562,7 +892,6 @@
         <div class="cb-bar">
           <span class="dollar" style="font-family:var(--mono)">$</span>
           <span class="lbl">pm --list ~/Documents</span>
-          <span class="cb-copy" data-copy="pm --list ~/Documents" role="button" tabindex="0" aria-label="Copy: pm --list ~/Documents"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Copy</span>
         </div>
         <pre><span class="d">PROJECT             LOC   SOURCE  NODE_MOD    TOTAL  TOP LANG</span>
 <span class="w">aurora-dashboard</span>  <span class="a">14.2k</span>    <span class="d">1.2M</span>     <span class="d">312M</span>   <span class="w">318M</span>  <span class="a">TypeScript 68%</span> <span class="d">main</span> <span class="a">✱3</span>
@@ -575,7 +904,6 @@
         <div class="cb-bar">
           <span class="dollar" style="font-family:var(--mono)">$</span>
           <span class="lbl">pm --json ~/Documents</span>
-          <span class="cb-copy" data-copy="pm --json ~/Documents" role="button" tabindex="0" aria-label="Copy: pm --json ~/Documents"><svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg><svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Copy</span>
         </div>
         <pre><span class="d">[</span>
   <span class="d">{</span>
@@ -597,12 +925,12 @@
   <!-- ===================== FINAL CTA ===================== -->
   <section class="wrap finale">
     <div class="finale-in" data-reveal>
-      <h2>Get your projects under control.</h2>
-      <p>One command, zero dependencies, and every project on your machine a keystroke away.</p>
+      <h2>Everything ready, right in your terminal.</h2>
+      <p>Find your projects, see what's running, and open an AI terminal — all local-first.</p>
       <div class="cta-row">
-        <div class="cmd" data-copy="npm i -g lazyproj" role="button" tabindex="0" aria-label="Copy install command">
+        <div class="cmd" data-copy="npm i -g folderpreview" role="button" tabindex="0" aria-label="Copy install command">
           <span class="dollar">$</span>
-          <code>npm i -g lazyproj</code>
+          <code>npm i -g folderpreview</code>
           <span class="copy">
             <svg class="ic-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
             <svg class="ic-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
@@ -626,14 +954,17 @@
         <a class="brand" href="#top">
           <svg class="logo" viewBox="0 0 36 36" aria-hidden="true">
             <rect width="36" height="36" rx="10" fill="url(#lg2)"/>
-            <path d="M11 13l5 5-5 5" fill="none" stroke="#06101f" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round"/>
-            <line x1="19" y1="23" x2="25" y2="23" stroke="#06101f" stroke-width="2.7" stroke-linecap="round"/>
+            <path d="M18 29.6C16.1 27.7 15.7 26.2 16.3 24.9C16.8 25.9 17.3 26.2 18 26.2C18.7 26.2 19.2 25.9 19.7 24.9C20.3 26.2 19.9 27.7 18 29.6Z" fill="#FBBF24"/>
+            <path d="M18 6.4C20.6 9 21.9 12.6 21.9 16.2V21.4C21.9 23.5 20.2 25.2 18 25.2C15.8 25.2 14.1 23.5 14.1 21.4V16.2C14.1 12.6 15.4 9 18 6.4Z" fill="#06101f"/>
+            <path d="M14.1 18.6L10.2 24.8L14.1 23.6Z" fill="#06101f"/>
+            <path d="M21.9 18.6L25.8 24.8L21.9 23.6Z" fill="#06101f"/>
+            <circle cx="18" cy="14.4" r="2.5" fill="#E9F5FF"/>
             <defs><linearGradient id="lg2" x1="0" y1="0" x2="36" y2="36"><stop offset="0" stop-color="#A8DCFF"/><stop offset="1" stop-color="#6EA8FF"/></linearGradient></defs>
           </svg>
-          pm
+          foldview
         </a>
-        <p>A zero-dependency terminal dashboard for browsing, opening and running your local projects.</p>
-        <div class="aliases">Also runs as <code>lazyproj</code>, <code>project-manager</code> and <code>folder</code>.</div>
+        <p>A friendly terminal home for projects, local apps, and AI coding agents.</p>
+        <div class="aliases">Also runs as <code>folderpreview</code>, <code>project-manager</code> and <code>foldview</code>.</div>
       </div>
       <div class="foot-cols">
         <div class="foot-col">
@@ -646,7 +977,7 @@
         <div class="foot-col">
           <h4>Project</h4>
           <a href="https://github.com/coolyiqiao123/lazyproj" target="_blank" rel="noopener">GitHub</a>
-          <a href="https://www.npmjs.com/package/lazyproj" target="_blank" rel="noopener">npm</a>
+          <a href="https://www.npmjs.com/package/folderpreview" target="_blank" rel="noopener">npm</a>
           <a href="https://github.com/coolyiqiao123/lazyproj#readme" target="_blank" rel="noopener">README</a>
           <a href="https://github.com/coolyiqiao123/lazyproj/issues" target="_blank" rel="noopener">Issues</a>
         </div>
@@ -705,16 +1036,55 @@
     reveals.forEach(function(el, i){ el.style.setProperty('--d', (i%5)*70 + 'ms'); io.observe(el); });
   }
 
+  /* ---------- blue circle cursor ---------- */
+  if(!reduce && window.matchMedia && matchMedia('(hover:hover) and (pointer:fine)').matches){
+    var ring = document.createElement('div'); ring.className = 'cursor-ring cursor-hide';
+    var dot  = document.createElement('div'); dot.className  = 'cursor-dot cursor-hide';
+    var glow = document.createElement('div'); glow.className = 'cursor-glow';
+    var grid = document.createElement('div'); grid.className = 'grid-glow'; grid.setAttribute('aria-hidden','true');
+    document.body.appendChild(grid); document.body.appendChild(glow); document.body.appendChild(ring); document.body.appendChild(dot);
+    document.documentElement.classList.add('has-cursor');
+
+    var mx = window.innerWidth/2, my = window.innerHeight/2, rx = mx, ry = my, seen = false;
+    var hoverSel = 'a,button,input,textarea,select,[role="button"],[tabindex],[data-copy],.card,.cmd,.row,.stat,.step,kbd,.icon-btn,.btn,.term,.run-term';
+    // text-bearing elements the flashlight lights up
+    var textSel  = 'h1,h2,h3,h4,p,li,code,kbd,a,span.grad,.eyebrow,.badge,.lead,.sub,.desc,.hero-note,.run-tag,.run-head,.d-title,.d-path,.stat .n,.stat .l,.term-title,.foot-brand p,.foot-bottom span';
+
+    window.addEventListener('mousemove', function(e){
+      mx = e.clientX; my = e.clientY;
+      dot.style.transform  = 'translate(' + mx + 'px,' + my + 'px)';
+      glow.style.transform = 'translate(' + mx + 'px,' + my + 'px)';
+      grid.style.setProperty('--gx', mx + 'px'); grid.style.setProperty('--gy', my + 'px');
+      if(!seen){ seen = true; ring.classList.remove('cursor-hide'); dot.classList.remove('cursor-hide'); grid.classList.add('on'); }
+    }, { passive:true });
+    document.addEventListener('mouseleave', function(){ ring.classList.add('cursor-hide'); dot.classList.add('cursor-hide'); glow.classList.remove('on'); grid.classList.remove('on'); seen = false; });
+    window.addEventListener('mousedown', function(){ dot.classList.add('down'); });
+    window.addEventListener('mouseup',   function(){ dot.classList.remove('down'); });
+    document.addEventListener('mouseover', function(e){
+      var t = e.target;
+      if(t.closest){
+        if(t.closest(hoverSel)) dot.classList.add('hover');
+        if(t.closest(textSel))  glow.classList.add('on');
+      }
+    });
+    document.addEventListener('mouseout', function(e){
+      var t = e.target, to = e.relatedTarget;
+      if(!t.closest) return;
+      if(t.closest(hoverSel) && !(to && to.closest && to.closest(hoverSel))) dot.classList.remove('hover');
+      if(t.closest(textSel)  && !(to && to.closest && to.closest(textSel)))  glow.classList.remove('on');
+    });
+  }
+
   /* ---------- live terminal demo ---------- */
   var projects = [
     // green (launchable) — alphabetical
     { name:'aurora-dashboard', path:'~/Documents/aurora-dashboard', port:3000, live:true,  launchable:true,  loc:'14,231', files:'188', nm:'312M', branch:'main', dirty:3,
       langs:[['TypeScript',68],['CSS',18],['JavaScript',14]] },
-    { name:'marketing-site',   path:'~/Documents/marketing-site', port:4321, live:false, launchable:true,  loc:'6,540', files:'96', nm:'184M', branch:'main', dirty:8,
+    { name:'marketing-site',   path:'~/Documents/marketing-site', port:4321, live:true,  launchable:true,  loc:'6,540', files:'96', nm:'184M', branch:'main', dirty:8,
       langs:[['Astro',54],['TypeScript',30],['CSS',16]] },
     { name:'payments-api',     path:'~/Documents/payments-api', port:null, live:false, launchable:true,  dev:'npm run dev', loc:'4,110', files:'71', nm:'92M', branch:'main', dirty:0,
       langs:[['TypeScript',90],['JavaScript',10]] },
-    { name:'storefront',       path:'~/Documents/storefront', port:5173, live:false, launchable:true,  loc:'9,420',  files:'142', nm:'268M', branch:'main', dirty:0,
+    { name:'storefront',       path:'~/Documents/storefront', port:5173, live:true,  launchable:true,  loc:'9,420',  files:'142', nm:'268M', branch:'main', dirty:0,
       langs:[['TypeScript',61],['Svelte',27],['CSS',12]] },
     // red (not launchable) — alphabetical
     { name:'design-tokens',    path:'~/Documents/design-tokens', port:null, live:false, launchable:false, loc:'1,920', files:'38', nm:'0', branch:'main', dirty:2,
@@ -747,12 +1117,12 @@
 
   function renderDetail(p){
     var live = p.live
-      ? '<span class="dot on"></span> localhost:'+p.port+' · <span class="on-t">live</span> — ↵ opens · x stops'
+      ? '<span class="d-stat"><span class="dot on"></span> localhost:'+p.port+' · <span class="on-t">live</span></span><span class="d-act">↵ open · x stop</span>'
       : p.port
-        ? '<span class="arrow">→</span> localhost:'+p.port+' · <span class="off-t">↵ launch — starts it, then opens</span>'
+        ? '<span class="d-msg"><span class="arrow">→</span> localhost:'+p.port+' · <span class="off-t">↵ launch — starts it, then opens</span></span>'
         : p.dev
-          ? '<span class="arrow">→</span> '+esc(p.dev)+' · <span class="off-t">↵ launch — starts it, then opens</span>'
-          : '<span class="off-t">— no web server detected —</span>';
+          ? '<span class="d-msg"><span class="arrow">→</span> '+esc(p.dev)+' · <span class="off-t">↵ launch — starts it, then opens</span></span>'
+          : '<span class="d-msg off-t">— no web server detected —</span>';
     var git = p.dirty>0
       ? p.branch+' <span class="amber">✱'+p.dirty+'</span> dirty'
       : p.branch+' <span class="green">✓</span> clean';
@@ -790,7 +1160,226 @@
     term.addEventListener('mouseleave', function(){ paused = false; });
     setInterval(function(){ if(!paused){ idx = (idx+1) % projects.length; paint(); } }, 2900);
   }
+
+  /* ---------- "just type view" → paint the real TUI dashboard ---------- */
+  (function(){
+    var typed  = document.getElementById('runTyped');
+    var screen = document.getElementById('runScreen');
+    if(!typed || !screen) return;
+    var CMD = 'foldview';
+    var L = 30, Rr = 42;                       // inner cell widths (frame = 79 cols)
+    function vlen(s){ return s.replace(/<[^>]*>/g,'').length; }   // visible length (spans are zero-width)
+    function padR(s, w){ var d = w - vlen(s); return d > 0 ? s + ' '.repeat(d) : s; }
+    function dash(n){ return '─'.repeat(n > 0 ? n : 0); }
+    function bars(pct){ var f = Math.round(pct/100*14); return '<span class="bar">'+'█'.repeat(f)+'</span><span class="d">'+'░'.repeat(14-f)+'</span>'; }
+    function kv(k, v){ var key = k + ':'; key += ' '.repeat(Math.max(0, 15 - key.length)); return '<span class="d">'+key+'</span><span class="w">'+v+'</span>'; }
+    function lang(n, pct){ var nm = n + ' '.repeat(Math.max(0, 11 - n.length)); return '<span class="w">'+nm+'</span>'+bars(pct)+' <span class="d">'+(pct<10?' ':'')+pct+'%</span>'; }
+
+    var demo = [   // launchable first; aurora selected. ● green=live, ○ green=stopped, ● red=not launchable
+      { dot:'g', ch:'●', name:'aurora-dashboard', port:'3000', live:true,  sel:true },
+      { dot:'g', ch:'●', name:'marketing-site',   port:'4321', live:true  },
+      { dot:'g', ch:'●', name:'storefront',       port:'5173', live:true  },
+      { dot:'g', ch:'○', name:'payments-api',     port:''                 },
+      { dot:'r', ch:'●', name:'design-tokens',    port:''                 },
+      { dot:'r', ch:'●', name:'ledger-cli',       port:''                 }
+    ];
+    var left = demo.map(function(p){
+      var dot  = '<span class="'+p.dot+'">'+p.ch+'</span>';
+      var nm   = p.sel ? '<span class="sel">'+p.name+'</span>' : '<span class="w">'+p.name+'</span>';
+      var port = p.port ? ('<span class="d">'+p.port+'</span>' + (p.live ? ' <span class="g">●</span>' : ' <span class="d">○</span>')) : '<span class="d">—</span>';
+      var head = (p.sel ? '<span class="b">▌</span>' : ' ') + dot + ' ' + nm;
+      var gap  = L - vlen(head) - vlen(port);
+      var cell = head + ' '.repeat(gap > 0 ? gap : 1) + port;
+      return p.sel ? '<span class="selrow">' + cell + '</span>' : cell;
+    });
+    var right = [
+      '<span class="w">aurora-dashboard</span>',
+      '<span class="d">~/Documents/aurora-dashboard</span>',
+      '<span class="bd">'+dash(Rr)+'</span>',
+      '',
+      '<span class="g">●</span> localhost:3000   <span class="g">live</span> <span class="d">— ↵ open</span>',
+      '',
+      kv('Lines of code','14,231'),
+      kv('Files','188'),
+      kv('Source size','1.2M'),
+      kv('node_modules','312M'),
+      kv('Total on disk','318M'),
+      kv('Modified','2h ago'),
+      '',
+      '<span class="d">LANGUAGES</span>',
+      lang('TypeScript',68),
+      lang('CSS',18),
+      lang('JavaScript',14)
+    ];
+
+    var rowsN = Math.max(left.length, right.length);
+    var lines = [];
+    lines.push('<span class="b">foldview</span> 🚀 <span class="d">·</span> 6 projects   <span class="d">~/Documents</span>          <span class="g">● 3000 4321 5173</span>');
+    lines.push('  <span class="chip">🚦 Launch</span>   <span class="d">↵ launch — opens the site, starts the dev server if needed</span>');
+    lines.push('<span class="bd">┌─ </span><span class="b">Projects</span><span class="bd"> '+dash(L+2-11)+'┬'+dash(Rr+2)+'┐</span>');
+    for(var i = 0; i < rowsN; i++){
+      lines.push('<span class="bd">│</span> ' + padR(left[i] || '', L) + ' <span class="bd">│</span> ' + padR(right[i] || '', Rr) + ' <span class="bd">│</span>');
+    }
+    lines.push('<span class="bd">└'+dash(L+2)+'┴'+dash(Rr+2)+'┘</span>');
+    lines.push(' <span class="d">↑↓ move · ↵ launch · d start · x stop · a AI · / find · ? help · q quit</span>');
+    var SCREEN = lines.join('\n');
+
+    if(reduce){ typed.textContent = CMD; screen.innerHTML = SCREEN; return; }
+    function loop(){
+      typed.textContent = ''; screen.innerHTML = '';
+      var i = 0;
+      (function type(){
+        if(i < CMD.length){ typed.textContent += CMD.charAt(i++); setTimeout(type, 200); return; }
+        setTimeout(function(){ screen.innerHTML = SCREEN; setTimeout(loop, 4600); }, 520);   // paint, hold, loop
+      })();
+    }
+    loop();
+  })();
+
+  /* ---------- smart nav: pinned on load, hide on scroll-down, reveal on scroll-up ---------- */
+  (function(){
+    var nav = document.querySelector('.nav');
+    if(!nav) return;
+    if(reduce){ nav.classList.remove('nav--hidden'); return; }   // reduced motion → keep it always visible
+    var lastY = window.pageYOffset || 0, ticking = false;
+    var TOP = 12, DELTA = 6;                                      // pin near the top; ignore tiny jitter
+    function update(){
+      var y = window.pageYOffset || 0;
+      if(y <= TOP)              nav.classList.remove('nav--hidden');  // very top / first load → shown, fixed
+      else if(y > lastY + DELTA) nav.classList.add('nav--hidden');    // scrolling down → hide
+      else if(y < lastY - DELTA) nav.classList.remove('nav--hidden'); // scrolling up a little → reveal
+      lastY = y; ticking = false;
+    }
+    window.addEventListener('scroll', function(){
+      if(!ticking){ ticking = true; requestAnimationFrame(update); }
+    }, { passive:true });
+    update();
+  })();
+
+  /* ---------- liquid glass: frost panels, pointer sheen, refraction ---------- */
+  (function(){
+    // frost the chrome panels — content surfaces (terminal, code blocks) stay solid for readability
+    Array.prototype.forEach.call(
+      document.querySelectorAll('.nav-in, .cmd, .card, .step, .stat, .finale-in'),
+      function(el){ el.classList.add('glass'); }
+    );
+    // pointer-tracked specular sheen on the discrete panels (not the full-width nav bar)
+    Array.prototype.forEach.call(
+      document.querySelectorAll('.cmd, .card, .step, .stat, .finale-in'),
+      function(el){
+        var sheen = document.createElement('span');
+        sheen.className = 'lg-sheen';
+        el.appendChild(sheen);
+        el.addEventListener('pointermove', function(e){
+          var r = el.getBoundingClientRect();
+          el.style.setProperty('--mx', ((e.clientX - r.left) / r.width  * 100) + '%');
+          el.style.setProperty('--my', ((e.clientY - r.top ) / r.height * 100) + '%');
+        });
+      }
+    );
+    // refraction layer behind the hero install pill — the signature element
+    var pill = document.querySelector('.cmd');
+    if(pill){
+      var rf = document.createElement('span');
+      rf.className = 'lg-refract';
+      pill.insertBefore(rf, pill.firstChild);
+    }
+  })();
+
+  /* ---------- night garden: spawn the butterflies ---------- */
+  (function(){
+    var host = document.getElementById('bflies');
+    var tpl  = document.getElementById('bfly-template');
+    if(!host || !tpl || !tpl.content) return;
+    // closed flight loops in a 1600×1000 field — every seam is parked offscreen so a lap never pops
+    var PATHS = [
+      // low meadow sweep — drifts beneath the bento cards and steps
+      'M -120 720 C 220 600 420 760 700 660 C 940 574 1040 700 1300 620 C 1520 554 1700 600 1740 500 C 1780 380 1560 330 1380 380 C 1120 452 980 330 760 400 C 540 470 420 360 200 430 C 20 490 -180 560 -120 720 Z',
+      // hero diagonal — climbs past the install pill, exits top-right
+      'M -100 980 C 150 870 260 760 430 640 C 560 545 620 480 780 470 C 980 458 1080 360 1220 240 C 1330 145 1440 60 1560 -60 C 1680 -180 900 -200 500 -140 C 100 -80 -160 300 -100 980 Z',
+      // high drift — small, far-away travellers
+      'M 1720 140 C 1440 90 1240 220 980 180 C 740 145 560 240 320 200 C 120 168 -60 220 -140 160 C -220 100 200 40 560 60 C 980 82 1420 30 1720 140 Z',
+      // centre wander — a loose figure through the middle of the page
+      'M -140 420 C 120 350 300 520 520 470 C 760 415 820 260 1060 300 C 1300 340 1360 520 1180 580 C 1000 640 820 540 640 580 C 460 620 260 700 60 640 C -100 592 -220 500 -140 420 Z'
+    ];
+    // v: colourway · p: PATHS index · s: scale · od: lap start (0-1) · fly/flap: seconds ·
+    // o: opacity · bl: depth blur px · fx/fy: parking spot if offset-path is unsupported
+    var FLOCK = [
+      {v:1, p:1, s:1.12, od:.10, fly:70,  flap:2.4, o:.95, bl:0,   fx:'34%', fy:'52%'},  // hero morpho
+      {v:3, p:1, s:.60,  od:.16, fly:70,  flap:2.1, o:.80, bl:.4,  fx:'56%', fy:'40%'},  // its cyan wingman
+      {v:2, p:3, s:.82,  od:0,   fly:86,  flap:2.6, o:.90, bl:0,   fx:'62%', fy:'46%'},
+      {v:1, p:0, s:.68,  od:.42, fly:92,  flap:2.3, o:.85, bl:.3,  fx:'20%', fy:'66%'},
+      {v:4, p:0, s:.50,  od:.75, fly:92,  flap:2.0, o:.70, bl:.8,  fx:'74%', fy:'62%'},
+      {v:2, p:2, s:.42,  od:.20, fly:118, flap:2.2, o:.55, bl:1.1, fx:'44%', fy:'16%'},
+      {v:1, p:2, s:.36,  od:.62, fly:118, flap:1.9, o:.50, bl:1.2, fx:'80%', fy:'12%'},
+      {v:3, p:3, s:.55,  od:.50, fly:86,  flap:2.2, o:.72, bl:.6,  fx:'12%', fy:'38%'}
+    ];
+    FLOCK.forEach(function(b){
+      var n = tpl.content.firstElementChild.cloneNode(true);
+      n.classList.add('v' + b.v);
+      n.style.setProperty('--path', 'path("' + PATHS[b.p] + '")');
+      n.style.setProperty('--od', (b.od * 100) + '%');   // static scatter under reduced-motion
+      n.style.setProperty('--fly', b.fly + 's');
+      n.style.setProperty('--flap', b.flap + 's');
+      n.style.setProperty('--s', b.s);
+      n.style.setProperty('--o', b.o);
+      n.style.setProperty('--bl', b.bl + 'px');
+      n.style.setProperty('--fx', b.fx);
+      n.style.setProperty('--fy', b.fy);
+      n.style.animationDelay = (-b.od * b.fly) + 's';    // stagger the flock around each loop
+      host.appendChild(n);
+    });
+  })();
+
+  /* 3d pointer-tilt removed — the real WebGL glass overlay (see module script below) can't
+     follow a CSS 3d rotation, so it detaches. Hover grow/lift (pure CSS) stays. */
 })();
+</script>
+
+<!-- real liquid glass — ybouane/liquidglass (WebGL). Refracts the backdrop through every
+     frosted panel. Loaded from CDN as an ES module; if it can't load (offline / no WebGL) the
+     page keeps the CSS-frost fallback and nothing else changes.
+     NOTE: the library only accepts glass elements that are DIRECT children of its root — ours
+     are nested inside sections, so it skips them with console warnings. Until the page is
+     restructured for it, the CSS backdrop-filter frost is the working liquid glass (it live-
+     refracts the night-garden butterflies). If you ever restructure so the WebGL path truly
+     mounts, draw the garden into a <canvas data-dynamic> so its refraction stays live too. -->
+<script type="module">
+  const reduce = matchMedia('(prefers-reduced-motion:reduce)').matches;
+  const glassEls = document.querySelectorAll('.nav-in, .cmd, .card, .step, .finale-in');
+  if(!reduce && glassEls.length){
+    try{
+      const { LiquidGlass } = await import('https://cdn.jsdelivr.net/npm/@ybouane/liquidglass@1.0.3/dist/index.js');
+      if(document.fonts && document.fonts.ready){ try{ await document.fonts.ready; }catch(_){} }
+      // match each panel's own rounding so the refraction mask lines up with the border
+      glassEls.forEach(el => {
+        const r = parseFloat(getComputedStyle(el).borderTopLeftRadius) || 14;
+        el.dataset.config = JSON.stringify({ cornerRadius: r });
+      });
+      await LiquidGlass.init({
+        root: document.body,
+        glassElements: glassEls,
+        defaults: {          // tune the glass here
+          blurAmount: 0.2,
+          refraction: 0.75,
+          chromAberration: 0.03,
+          edgeHighlight: 0.6,
+          specular: 0.45,
+          tintStrength: 0.09,
+          saturation: 1.12,
+          brightness: 1.02,
+          shadowOpacity: 0.35
+        }
+      });
+      // only stand down the CSS frost once a WebGL glass canvas actually mounted — the lib
+      // injects a <canvas> as each accepted panel's first child. If every panel was skipped
+      // (nested-glass rejection), adding .lg-live here would strip the only glass we have.
+      const mounted = Array.prototype.some.call(glassEls, el => el.querySelector(':scope > canvas'));
+      if(mounted) document.documentElement.classList.add('lg-live');
+    }catch(err){
+      /* CDN blocked or no WebGL — CSS .glass frost stays; no visual regression */
+    }
+  }
 </script>
 </body>
 </html>

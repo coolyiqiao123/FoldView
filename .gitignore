@@ -5,6 +5,10 @@
 # dependencies
 node_modules/
 
+# swift build output (mac menu-bar companion)
+.build/
+*.dSYM/
+
 # os
 .DS_Store
 
