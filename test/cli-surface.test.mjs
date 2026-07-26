@@ -84,9 +84,34 @@ test('pm status: rejects an unsupported --format', () => {
   assert.throws(() => run(['status', '--format', 'xml']));
 });
 
-test('pm menubar / --force-install: prints a stub describing what would be installed/launched', () => {
-  assert.match(run(['menubar']), /menu-bar companion/);
-  assert.match(run(['menubar', '--force-install']), /install|launch/);
+test('pm config get/set and aiclis add/remove round-trip through the atomic Node config bridge', () => {
+  run(['config', 'set', 'menubar.refreshSeconds', '45']);
+  run(['config', 'set', 'menubar.showDiscoveredApps', 'false']);
+  let cfg = JSON.parse(run(['config', 'get', '--json']));
+  assert.deepEqual(cfg.menubar, { refreshSeconds: 45, showDiscoveredApps: false });
+  assert.throws(() => run(['config', 'set', 'menubar.refreshSeconds', '14']));
+  assert.throws(() => run(['config', 'set', 'menubar.showDiscoveredApps', 'yes']));
+
+  const bin = tmpDir('foldview-custom-cli-');
+  const executable = path.join(bin, 'my agent');
+  fs.writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  run(['aiclis', 'add', '--name', 'My Agent', '--executable', executable]);
+  cfg = JSON.parse(run(['config', 'get', '--json']));
+  assert.deepEqual(cfg.aiClis, [{ name: 'My Agent', executable }]);
+  run(['aiclis', 'remove', '--executable', executable]);
+  assert.deepEqual(JSON.parse(run(['config', 'get', '--json'])).aiClis, []);
+  assert.throws(() => run(['aiclis', 'add', '--name', 'Bad', '--executable', 'echo; nope']));
+});
+
+test('pm menubar --status is read-only and reports the exact Foldview.app target', { skip: process.platform !== 'darwin' }, () => {
+  const record = path.join(home, 'Library', 'Application Support', 'Foldview', 'cli-path-v1');
+  assert.equal(fs.existsSync(record), false);
+  const status = JSON.parse(run(['menubar', '--status']));
+  assert.equal(status.appPath, path.join(home, 'Applications', 'Foldview.app'));
+  assert.equal(status.cliPathRecord, record);
+  assert.equal(typeof status.installed, 'boolean');
+  assert.equal(typeof status.running, 'boolean');
+  assert.equal(fs.existsSync(record), false, '--status must not record or mutate the CLI path');
 });
 
 test('status --format menubar-json: warm refresh comfortably meets the <500ms target for an ordinary root', (t) => {

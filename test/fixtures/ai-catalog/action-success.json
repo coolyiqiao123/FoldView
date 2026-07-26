@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "ok": true,
+  "launched": 3,
+  "provider": "codex",
+  "model": "codex-deep",
+  "effort": "high"
+}
+

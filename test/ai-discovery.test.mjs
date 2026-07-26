@@ -8,7 +8,8 @@ import { freshHome, makeBin, withPath, tmpDir } from './helpers.mjs';
 
 freshHome();
 const mod = await import('../folder.mjs');
-const { discoverAIClis, resolveExecutable, assignFreeKey, resolveCustomCli, saveCustomCli, readConfig, writeConfig } = mod;
+const { discoverAIClis, resolveExecutable, assignFreeKey, resolveCustomCli, saveCustomCli, readConfig, writeConfig,
+  classifyAIProvider } = mod;
 
 test('resolveExecutable: `command -v` only finds what is actually resolvable on PATH', () => {
   const bin = tmpDir('foldview-bin-');
@@ -30,6 +31,22 @@ test('discoverAIClis: only resolvable known CLIs appear, each with its table sho
     assert.deepEqual(found.map(f => f.name).sort(), ['Claude', 'Gemini']);
     assert.equal(found.find(f => f.name === 'Claude').key, 'c');
     assert.equal(found.find(f => f.name === 'Gemini').key, 'g');
+  } finally { restore(); }
+});
+
+test('discoverAIClis: recognizes native Codex and Kimi with stable internal provider IDs', () => {
+  const bin = tmpDir('foldview-bin-');
+  const codex = makeBin(bin, 'codex', '#!/bin/sh\n');
+  const kimi = makeBin(bin, 'kimi', '#!/bin/sh\n');
+  const restore = withPath([bin]);
+  try {
+    const found = discoverAIClis();
+    assert.deepEqual(found.map(({ name, provider }) => ({ name, provider })), [
+      { name: 'Codex', provider: 'codex' },
+      { name: 'Kimi Code', provider: 'kimi' },
+    ]);
+    assert.equal(classifyAIProvider(codex), 'codex');
+    assert.equal(classifyAIProvider(kimi), 'kimi');
   } finally { restore(); }
 });
 
@@ -77,19 +94,19 @@ test('resolveCustomCli: resolves a bare name via PATH, validates an absolute pat
   } finally { restore(); }
 });
 
-test('saveCustomCli + discoverAIClis: persists, dedupes by resolved absolute path, preserves unrelated config', () => {
+test('saveCustomCli + discoverAIClis: persists, dedupes by resolved absolute path, preserves unrelated recognized config', () => {
   const bin = tmpDir('foldview-bin-');
   const exe = makeBin(bin, 'my-agent', '#!/bin/sh\n');
   const restore = withPath([bin]);
   try {
-    writeConfig({ apps: [{ name: 'kept', port: 4321 }], someUnknownField: 'preserve-me' });
+    writeConfig({ apps: [{ name: 'kept', port: 4321 }], hidden: [4322] });
     saveCustomCli({ name: 'my-agent', executable: exe });
     saveCustomCli({ name: 'my-agent-dup', executable: exe });   // same resolved path — must not duplicate
 
     const cfg = readConfig();
     assert.equal(cfg.aiClis.filter(a => a.executable === exe).length, 1, 'deduped by resolved absolute path');
     assert.equal(cfg.apps[0].name, 'kept', 'unrelated config field preserved');
-    assert.equal(cfg.someUnknownField, 'preserve-me', 'unknown field preserved');
+    assert.deepEqual(cfg.hidden, [4322], 'unrelated recognized field preserved');
 
     const found = discoverAIClis().find(f => f.executable === exe);
     assert.ok(found, 'custom CLI appears in discovery');

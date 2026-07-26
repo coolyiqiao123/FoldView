@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-19T00:00:00.000Z",
+  "providers": [
+    {
+      "id": "codex",
+      "name": "Codex",
+      "executable": null,
+      "available": false,
+      "error": {
+        "code": "provider_unavailable",
+        "message": "Codex is not installed or executable.",
+        "provider": "codex",
+        "retryable": true
+      },
+      "defaultModel": null,
+      "defaultEffort": null,
+      "models": []
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi Code",
+      "executable": "/opt/foldview-test/bin/kimi",
+      "available": false,
+      "error": {
+        "code": "malformed_catalog",
+        "message": "Kimi Code configuration uses an unsupported multiline value.",
+        "provider": "kimi",
+        "retryable": true
+      },
+      "defaultModel": null,
+      "defaultEffort": null,
+      "models": []
+    }
+  ]
+}
+

@@ -38,12 +38,18 @@ on your machine — nothing is uploaded or sent over the network.
 ## Quick start
 
 ```bash
-git clone https://github.com/coolyiqiao123/lazyproj.git foldview
-cd foldview
-npm link          # installs the `pm` command globally (aliases: folderpreview, project-manager, foldview)
+npm i -g folderpreview     # installs `pm` (aliases: foldview, folderpreview, project-manager)
 
 pm                 # scan the current directory
 pm ~/Projects      # scan a folder of projects
+```
+
+From source:
+
+```bash
+git clone https://github.com/coolyiqiao123/FoldView.git foldview
+cd foldview
+npm link          # installs the `pm` command globally
 ```
 
 Or run it directly without installing anything:
@@ -83,13 +89,23 @@ Select a project and press `a`. The footer lists every AI CLI Foldview found
 on your machine, plus a custom option:
 
 ```text
-AI terminals — c claude · x codex · g gemini · + custom · esc cancel
+AI terminals — c claude · x codex · k kimi code · g gemini · + custom · esc cancel
 ```
 
-Press the CLI's shortcut, then a digit `1`–`9` for how many windows to open:
+Press the CLI's shortcut. For providers that expose a model catalog (Codex and
+Kimi Code), Foldview loads it and lets you dial in the model and reasoning
+effort with `←→` before continuing — the catalog comes from the CLI itself, so
+the list is whatever your installed version actually supports:
 
 ```text
-claude — how many windows? 1-9 · esc cancel
+Codex model 2/6: GPT-5 · ←→ choose · ↵ next · esc back
+gpt-5 · effort 3/4: high · ←→ choose · ↵ next · esc back
+```
+
+Then a digit `1`–`9` for how many windows to open:
+
+```text
+Codex · GPT-5 · high — how many windows? 1-9 · esc back
 ```
 
 Foldview opens that many Terminal.app windows, each started in the selected
@@ -110,9 +126,13 @@ machine. Only CLIs that actually resolve are shown:
 | --- | --- | --- |
 | `c` | Claude | `claude` |
 | `x` | Codex | `codex` |
+| `k` | Kimi Code | `kimi` |
 | `g` | Gemini | `gemini` |
 | `o` | OpenCode | `opencode` |
 | `i` | Aider | `aider` |
+
+Codex and Kimi Code additionally expose a live model catalog, so their model
+and effort can be chosen per launch and saved as a default.
 
 **Custom CLIs.** Press `+` in the AI terminals prompt to add any other
 executable by name or absolute path. Valid entries are saved to
@@ -149,6 +169,7 @@ For scripts and other tools:
 ```bash
 pm --list ~/Documents       # plain stats table
 pm --json ~/Documents       # JSON
+pm serve ./site 8899        # serve a static folder on localhost, zero dependencies
 ```
 
 These stay unchanged by the AI terminals feature and the CLI bridge below.
@@ -169,12 +190,37 @@ pm action start --project <absolute-directory> --open
 pm action stop --project <absolute-directory>
 pm action editor --project <absolute-directory>
 pm action ai --project <absolute-directory> --cli <absolute-executable> --count <1-9>
-pm menubar
+             [--provider <codex|kimi>] [--model <id>] [--effort <value>] [--json]
+pm ai catalog [--provider <codex|kimi>] --json
+pm ai defaults get --provider <codex|kimi> --json
+pm ai defaults set --provider <codex|kimi> --model <id> [--effort <value>] --json
+pm config get --json
+pm config set menubar.<setting> <value>
+pm aiclis add --name <name> --executable <path>
+pm aiclis remove --executable <path>
+pm menubar [--status|--force-install]
+pm agents --json
+pm burn --json [--days N] [--refresh]
+pm hooks install|uninstall|status
+pm hook-bridge <claude|kimi> <EventName>   # internal shim used by installed hooks
 ```
 
 `pm status --format menubar-json` is the fast path: it skips full
 lines-of-code, disk-size, and git analysis, so it stays quick even on large
 project roots.
+
+`pm ai catalog` and `pm ai defaults` are the model-control bridge: Node owns
+the provider catalogs and the saved model/effort defaults, so the TUI, the
+CLI, and the menu-bar sliders all read and write the same source of truth.
+
+`pm agents --json` reports the LLM coding agents currently active on this
+machine (Claude Code, Kimi Code, Codex, claude-flow daemons) with roles,
+current action, and last activity. `pm burn --json` aggregates token usage and
+estimated cost per CLI/model, wall-clock coding time, Codex plan quota, and
+GitHub commit contributions (via `gh`, the only network call). Both are local
+reads of the CLIs' own transcript files — nothing is uploaded. `pm hooks`
+installs/removes the hook entries that let the macOS companion show and answer
+approval prompts (see below).
 
 ## macOS menu-bar companion (optional)
 
@@ -183,6 +229,15 @@ companion (`mac/`) built with SwiftUI. It shows which projects are live,
 your recent projects, and lets you open, start, or launch an AI terminal
 without finding a Terminal window first — all through the same CLI bridge
 above, so there's no separate scanning or launch logic to keep in sync.
+
+It also runs **Notch Nook**: a click-to-open panel under the MacBook notch
+with four tabs — Agents (all your running LLM agents with their roles and
+current actions, plus **Approve/Deny** for Claude Code permission prompts,
+delivered over a loopback-only bridge and `pm hooks install`), Foldview (your
+localhost projects), Burn (token/cost analytics, coding time, GitHub commits),
+and Fans (MacBook fan speed readout and control via a one-password-prompt
+root helper). See `mac/README.md` for the bridge contract, hook support
+matrix, and fan privilege model.
 
 The companion is entirely optional. `pm menubar` installs or launches it,
 and the Node CLI and TUI work exactly the same with or without it installed.
@@ -218,3 +273,26 @@ unrelated settings and unknown fields are preserved:
 ```
 
 No dependencies, no network calls — pure Node.
+
+## Website
+
+The marketing site lives in `site/` as hand-authored `index.html`,
+`styles.css`, and `app.js` — no build step, no framework, no bundler. Preview
+it with Foldview's own static server:
+
+```bash
+pm serve site 8899     # → http://localhost:8899
+```
+
+## Development
+
+```bash
+npm test                       # Node test suite (zero dependencies)
+cd mac && swift test           # macOS menu-bar companion
+```
+
+Contributions and issues: https://github.com/coolyiqiao123/FoldView
+
+## License
+
+MIT

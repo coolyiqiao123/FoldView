@@ -1,57 +1,96 @@
-// Unit tests: ~/.foldview.json schema defaults, atomic tmp+rename writes, and read-merge-write
-// preservation of unrelated/unknown fields (incl. under simulated concurrent writers).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshHome } from './helpers.mjs';
+import { spawn } from 'node:child_process';
+import { FOLDER_MJS, freshHome } from './helpers.mjs';
 
-freshHome();
+const home = freshHome();
 const { readConfig, writeConfig, updateConfig, CONFIG_PATH } = await import('../folder.mjs');
 
-test('readConfig: a missing file returns a fully-defaulted schemaVersion-1 shape', () => {
+test('missing config returns the exact normalized schema-v1 shape', () => {
+  assert.deepEqual(readConfig(), {
+    schemaVersion: 1, roots: [], recentProjects: [],
+    menubar: { refreshSeconds: 60, showDiscoveredApps: true },
+    apps: [], hidden: [], aiClis: [],
+  });
+});
+
+test('write is atomic, 0600, normalized, and preserves every recognized field', () => {
+  assert.equal(writeConfig({
+    roots: ['/tmp/root'], recentProjects: ['/tmp/recent'],
+    menubar: { refreshSeconds: 120, showDiscoveredApps: false },
+    apps: [{ name: 'x', port: 4321, path: '/tmp/x' }], hidden: [4444],
+    aiClis: [{ name: 'agent', executable: '/bin/agent' }], ignored: 'drop me',
+  }), true);
   const cfg = readConfig();
-  assert.equal(cfg.schemaVersion, 1);
-  assert.deepEqual(cfg.roots, []);
-  assert.deepEqual(cfg.recentProjects, []);
-  assert.deepEqual(cfg.menubar, { refreshSeconds: 60, showDiscoveredApps: true });
-  assert.deepEqual(cfg.apps, []);
-  assert.deepEqual(cfg.hidden, []);
-  assert.deepEqual(cfg.aiClis, []);
+  assert.deepEqual(Object.keys(cfg), ['schemaVersion', 'roots', 'recentProjects', 'menubar', 'apps', 'hidden', 'aiClis']);
+  assert.deepEqual(cfg.roots, ['/tmp/root']);
+  assert.deepEqual(cfg.recentProjects, ['/tmp/recent']);
+  assert.deepEqual(cfg.apps, [{ name: 'x', port: 4321, path: '/tmp/x' }]);
+  assert.deepEqual(cfg.hidden, [4444]);
+  assert.deepEqual(cfg.aiClis, [{ name: 'agent', executable: '/bin/agent' }]);
+  assert.equal(fs.statSync(CONFIG_PATH).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readdirSync(home).filter(name => name.includes('.tmp-')), []);
 });
 
-test('writeConfig: atomic tmp+rename — file is always valid JSON, no stray .tmp- files remain', () => {
-  for (let i = 0; i < 5; i++) updateConfig(cfg => { cfg.roots.push(`/tmp/root-${i}`); });
-  const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
-  const parsed = JSON.parse(raw);
-  assert.equal(parsed.roots.length, 5);
-  const strays = fs.readdirSync(path.dirname(CONFIG_PATH)).filter(f => f.includes('.tmp-'));
-  assert.deepEqual(strays, []);
-});
-
-test('updateConfig: read-merge-write preserves fields set by a different, unrelated call', () => {
-  writeConfig({ apps: [{ name: 'x', port: 1 }], hidden: [2], custom: { nested: true } });
-  updateConfig(cfg => { cfg.roots.push('/tmp/newroot'); });
+test('updateConfig performs a locked read-modify-write and preserves unrelated recognized fields', () => {
+  assert.equal(updateConfig(cfg => cfg.roots.push('/tmp/second')), true);
   const cfg = readConfig();
-  assert.equal(cfg.apps[0].name, 'x');
-  assert.deepEqual(cfg.hidden, [2]);
-  assert.deepEqual(cfg.custom, { nested: true });
-  assert.deepEqual(cfg.roots, ['/tmp/newroot']);
+  assert.deepEqual(cfg.roots, ['/tmp/root', '/tmp/second']);
+  assert.deepEqual(cfg.aiClis, [{ name: 'agent', executable: '/bin/agent' }]);
+  assert.deepEqual(cfg.apps, [{ name: 'x', port: 4321, path: '/tmp/x' }]);
 });
 
-test('updateConfig: simulated concurrent writers each land without corrupting the file', () => {
+test('rejects corrupt, unknown-schema, malformed, and insecure config files', () => {
+  const cases = [
+    ['{not json', /corrupt JSON/],
+    [JSON.stringify({ schemaVersion: 2 }), /unsupported schemaVersion/],
+    [JSON.stringify({ roots: ['relative'] }), /must be an absolute path/],
+    [JSON.stringify({ menubar: { refreshSeconds: 1 } }), /integer from 15 to 600/],
+    [JSON.stringify({ aiClis: [{ name: 'x', executable: 'relative' }] }), /must be absolute/],
+  ];
+  for (const [contents, expected] of cases) {
+    fs.writeFileSync(CONFIG_PATH, contents, { mode: 0o600 });
+    fs.chmodSync(CONFIG_PATH, 0o600);
+    assert.throws(() => readConfig(), expected);
+  }
+  fs.writeFileSync(CONFIG_PATH, '{}', { mode: 0o600 });
+  fs.chmodSync(CONFIG_PATH, 0o644);
+  assert.throws(() => readConfig(), /0600 regular file/);
+  fs.unlinkSync(CONFIG_PATH);
+  fs.symlinkSync('/dev/null', CONFIG_PATH);
+  assert.throws(() => readConfig(), /0600 regular file/);
+  fs.unlinkSync(CONFIG_PATH);
+  fs.mkdirSync(CONFIG_PATH);
+  assert.throws(() => readConfig(), /0600 regular file/);
+  fs.rmdirSync(CONFIG_PATH);
   writeConfig({});
-  // interleave two "processes" racing to write different fields
-  const cfgA = readConfig(); cfgA.roots.push('/from/A');
-  const cfgB = readConfig(); cfgB.aiClis.push({ name: 'agentB', executable: '/bin/agentB' });
-  writeConfig(cfgA);
-  writeConfig(cfgB);   // last writer wins for fields it touched, but the file itself stays valid
-  const final = readConfig();
-  assert.doesNotThrow(() => JSON.stringify(final));
-  assert.deepEqual(final.aiClis, [{ name: 'agentB', executable: '/bin/agentB' }]);
 });
 
-test('writeConfig: always stamps schemaVersion 1, even for a hand-built object', () => {
-  writeConfig({ roots: ['/x'] });
-  assert.equal(readConfig().schemaVersion, 1);
+function runCLI(args) {
+  return new Promise((resolve, reject) => {
+    const env = { ...process.env, HOME: home };
+    delete env.PM_NO_MAIN;
+    const child = spawn(process.execPath, [FOLDER_MJS, ...args], { env, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('exit', code => code === 0 ? resolve() : reject(new Error(`exit ${code}: ${stderr}`)));
+  });
+}
+
+test('concurrent CLI writers serialize without losing any read-modify-write update', async () => {
+  writeConfig({});
+  const executables = Array.from({ length: 12 }, (_, index) => {
+    const executable = path.join(home, `agent-${index}`);
+    fs.writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+    return executable;
+  });
+  await Promise.all(executables.map((executable, index) =>
+    runCLI(['aiclis', 'add', '--name', `agent ${index}`, '--executable', executable])));
+  const cfg = readConfig();
+  assert.equal(cfg.aiClis.length, executables.length);
+  assert.deepEqual(new Set(cfg.aiClis.map(item => item.executable)), new Set(executables));
+  assert.equal(fs.existsSync(CONFIG_PATH + '.lock'), false);
 });

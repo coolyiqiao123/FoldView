@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "provider": "codex",
+  "defaultModel": "codex-deep",
+  "defaultEffort": "high"
+}
+

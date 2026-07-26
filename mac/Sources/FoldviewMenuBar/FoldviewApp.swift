@@ -12,7 +12,17 @@ import AppKit
 @main
 struct FoldviewApp: App {
     @NSApplicationDelegateAdaptor(FoldviewAppDelegate.self) private var appDelegate
-    @StateObject private var store = AppStore()
+    @StateObject private var store: AppStore
+
+    init() {
+        // Helper mode first: when re-executed as root for a fan write this
+        // runs the SMC write and exits before any scene exists. See
+        // Fans/FanWriteHelper.swift.
+        FanWriteHelper.exitIfHelperInvocation(CommandLine.arguments)
+        let appStore = AppStore()
+        _store = StateObject(wrappedValue: appStore)
+        _appDelegate.wrappedValue.appStore = appStore
+    }
 
     var body: some Scene {
         MenuBarExtra {
@@ -31,8 +41,54 @@ struct FoldviewApp: App {
 }
 
 final class FoldviewAppDelegate: NSObject, NSApplicationDelegate {
+    /// Handed over from `FoldviewApp.init` so the notch panel shares the same
+    /// AppStore instance as the menu-bar popover.
+    var appStore: AppStore?
+
+    private var bridgeServer: NotchBridgeServer?
+    private var notchController: NotchPanelController?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        Task { @MainActor [weak self] in
+            guard let self, let appStore = self.appStore else { return }
+
+            // Notch stores. The agents/burn stores get their own lightweight
+            // CLI adapter instance; resolution of the `pm` executable is
+            // stateless and shared via the same resolver chain.
+            let cli = FoldviewCLI()
+            let activityStore = AgentActivityStore()
+            let agentsStore = AgentsStore(cli: cli, activityStore: activityStore)
+            let burnStore = BurnStore(cli: cli)
+            let fanStore = FanStore()
+
+            // Localhost approval bridge (127.0.0.1 only, ephemeral port,
+            // per-launch token; state file written once the port is known).
+            let bridge = NotchBridgeServer(store: activityStore)
+            do {
+                try await bridge.start()
+                self.bridgeServer = bridge
+            } catch {
+                appStore.reportError(error)
+            }
+
+            // Click-to-open notch panel, collapsed pill under the notch.
+            let controller = NotchPanelController(
+                appStore: appStore,
+                agentsStore: agentsStore,
+                burnStore: burnStore,
+                fanStore: fanStore,
+                activityStore: activityStore
+            )
+            controller.show()
+            self.notchController = controller
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Stops the listener and removes the bridge state file so stale shims
+        // never talk to a dead port.
+        bridgeServer?.stop()
     }
 }
 

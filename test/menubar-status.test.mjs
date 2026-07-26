@@ -4,7 +4,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshHome, tmpDir } from './helpers.mjs';
+import { freshHome, makeBin, tmpDir, withPath } from './helpers.mjs';
 
 freshHome();
 const mod = await import('../folder.mjs');
@@ -20,11 +20,11 @@ test('missing roots: falls back to cwd and still returns a valid schemaVersion-1
   assert.ok(Array.isArray(payload.aiClis));
 });
 
-test('invalid/corrupt config file: does not crash status — falls back to defaults', async () => {
-  fs.writeFileSync(CONFIG_PATH, '{ not valid json ');
-  const payload = await buildMenubarStatus();
-  assert.equal(payload.schemaVersion, 1);
-  assert.deepEqual(payload.projects, []);
+test('invalid/corrupt config file is rejected instead of silently changing status semantics', async () => {
+  fs.writeFileSync(CONFIG_PATH, '{ not valid json ', { mode: 0o600 });
+  fs.chmodSync(CONFIG_PATH, 0o600);
+  await assert.rejects(() => buildMenubarStatus(), /corrupt JSON/);
+  fs.unlinkSync(CONFIG_PATH);
 });
 
 test('empty project list: a root with no marker directories reports an empty, internally-consistent list', async () => {
@@ -72,4 +72,37 @@ test('aiClis in the payload only contain {name, executable} — no key/shortcut 
   for (const cli of payload.aiClis) {
     assert.deepEqual(Object.keys(cli).sort(), ['executable', 'name']);
   }
+});
+
+test('periodic status discovers provider executables but never invokes provider catalog commands', async () => {
+  const bin = tmpDir('foldview-status-provider-bin-');
+  const marker = path.join(bin, 'provider-was-invoked');
+  makeBin(bin, 'codex', `#!/bin/sh\n/bin/touch '${marker}'\nexit 91\n`);
+  makeBin(bin, 'kimi', `#!/bin/sh\n/bin/touch '${marker}'\nexit 92\n`);
+  const restore = withPath([bin]);
+  try {
+    writeConfig({});
+    const payload = await buildMenubarStatus();
+    assert.ok(payload.aiClis.some(cli => cli.name === 'Codex'));
+    assert.ok(payload.aiClis.some(cli => cli.name === 'Kimi Code'));
+    assert.equal(fs.existsSync(marker), false);
+  } finally { restore(); }
+});
+
+test('showDiscoveredApps hides app rows without removing project rows', async () => {
+  const root = tmpDir('foldview-visibility-root-');
+  const proj = path.join(root, 'project');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, 'package.json'), JSON.stringify({ name: 'project', scripts: { dev: 'vite' } }));
+  writeConfig({ roots: [root], apps: [{ name: 'Pinned local app', url: 'http://localhost:65534' }],
+    menubar: { refreshSeconds: 60, showDiscoveredApps: false } });
+  let payload = await buildMenubarStatus();
+  assert.ok(payload.projects.some(row => row.name === 'project' && row.kind === 'project'));
+  assert.ok(!payload.projects.some(row => row.kind === 'app'));
+
+  writeConfig({ roots: [root], apps: [{ name: 'Pinned local app', url: 'http://localhost:65534' }],
+    menubar: { refreshSeconds: 60, showDiscoveredApps: true } });
+  payload = await buildMenubarStatus();
+  assert.ok(payload.projects.some(row => row.name === 'project' && row.kind === 'project'));
+  assert.ok(payload.projects.some(row => row.name === 'Pinned local app' && row.kind === 'app'));
 });

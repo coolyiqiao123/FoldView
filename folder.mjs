@@ -12,6 +12,8 @@
 //   node folder.mjs roots list|add|remove <dir>     manage scanned project roots
 //   node folder.mjs action open|start|stop|editor|ai --project <dir> [...]  run one action
 //   node folder.mjs menubar [--force-install]       install/launch the menu-bar companion
+//   node folder.mjs config get --json | set <key> <value>
+//   node folder.mjs aiclis add|remove [...]          manage custom AI CLIs safely
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -19,7 +21,8 @@ import os from 'node:os';
 import net from 'node:net';
 import http from 'node:http';
 import readline from 'node:readline';
-import { execSync, execFile, spawn } from 'node:child_process';
+import { execSync, execFileSync, execFile, spawn, spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const PLATFORM = process.platform;               // 'darwin' | 'linux' | 'win32' | …
@@ -70,7 +73,8 @@ const C = {
   faint:  [80,  98,  118],   // cooler faint
   border: [52,  72,  94],    // blue-gray border
   green:  [88,  214, 158],   // live / launchable (teal-green, the one warm-ish signal)
-  notRun: [228, 102, 102],   // not launchable — a true red (theme's "red" slot is actually blue)
+  notRun: [228, 102, 102],   // hard error only (e.g. push failed) — a true red
+  caution:[232, 154, 70],    // has a localhost / exists but foldview can't launch it — orange, not alarming red
   blue:   [130, 206, 236],   // links / dev command — light cyan
   selBg:  [22,  36,  54],    // dark navy selection background
   bar:    [150, 211, 245],   // bar fill — baby blue
@@ -82,6 +86,7 @@ const GRAD = [C.amber, C.orange, C.red];
 // The foldview wordmark gets its own light-orange ramp so ONLY the brand is orange — the
 // generic gradient() (project-name headline, Launch border) stays on the cool GRAD.
 const BRAND_GRAD = [[255, 198, 132], [255, 158, 74]];
+const wordmark = text => gradient(text, BRAND_GRAD);   // light-orange foldview wordmark
 
 const lerp = (a, b, t) => a.map((v, i) => Math.round(v + (b[i] - v) * t));
 function lerpStops(stops, t) {
@@ -155,6 +160,7 @@ function ago(ms) {
   return `${Math.floor(d / 365)}y ago`;
 }
 const shq = p => `'` + String(p).replace(/'/g, `'\\''`) + `'`;
+const quoteEnv = ({ name, value }) => `${name}=${shq(value)}`;
 // escape a string for embedding inside a double-quoted AppleScript string literal
 const asq = s => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 function sh(cmd, timeout = 4000) {
@@ -168,7 +174,8 @@ function sh(cmd, timeout = 4000) {
 // for single-key shortcut assignment.
 const KNOWN_AI_CLIS = [
   { key: 'c', name: 'Claude', executable: 'claude' },
-  { key: 'x', name: 'Codex', executable: 'codex' },
+  { key: 'x', name: 'Codex', executable: 'codex', provider: 'codex' },
+  { key: 'k', name: 'Kimi Code', executable: 'kimi', provider: 'kimi' },
   { key: 'g', name: 'Gemini', executable: 'gemini' },
   { key: 'o', name: 'OpenCode', executable: 'opencode' },
   { key: 'i', name: 'Aider', executable: 'aider' },
@@ -206,7 +213,7 @@ function discoverAIClis() {
     seen.add(exe);
     const key = !used.has(k.key) ? k.key : assignFreeKey(k.name, used);
     if (key) used.add(key);
-    out.push({ name: k.name, executable: exe, key });
+    out.push({ name: k.name, executable: exe, key, provider: k.provider || null });
   }
   for (const entry of (Array.isArray(cfg.aiClis) ? cfg.aiClis : [])) {
     if (!entry || !entry.executable) continue;
@@ -220,9 +227,889 @@ function discoverAIClis() {
     const name = entry.name || path.basename(exe);
     const key = assignFreeKey(name, used);
     if (key) used.add(key);
-    out.push({ name, executable: exe, key });
+    out.push({ name, executable: exe, key, provider: null });
   }
   return out;
+}
+
+// ─────────────────────── AI model provider adapters ───────────────────────
+// These helpers are deliberately independent from the periodic status path. Catalog probing and
+// provider-config reads happen only when an explicit `pm ai …` command (or a direct test) calls
+// them. The menu-bar schema continues to project discovery entries down to {name, executable}.
+const AI_PROVIDER_META = Object.freeze({
+  codex: { name: 'Codex', executable: 'codex' },
+  kimi: { name: 'Kimi Code', executable: 'kimi' },
+});
+const AI_MAX_INPUT_BYTES = 8 * 1024 * 1024;
+const AI_MAX_MODELS = 256;
+const AI_MAX_EFFORTS = 16;
+const AI_MAX_RAW_STRING = 4096;
+const AI_BIDI = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/gu;
+const AI_BIDI_TEST = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+const AI_FORBIDDEN_ID = /[\p{Cc}\p{Cf}\u007f]/u;
+const AI_EFFORT = /^[A-Za-z0-9._-]{1,64}$/;
+
+class AIProviderError extends Error {
+  constructor(code, message, provider = null, fields = {}) {
+    super(message);
+    this.name = 'AIProviderError';
+    this.code = code;
+    this.provider = provider;
+    this.retryable = !['invalid_arguments', 'unsupported_provider', 'provider_mismatch',
+      'unsupported_model', 'unsupported_effort'].includes(code);
+    Object.assign(this, fields);
+  }
+  toJSON() {
+    const out = { code: this.code, message: sanitizeAIText(this.message, 240), retryable: this.retryable };
+    if (this.provider && AI_PROVIDER_META[this.provider]) out.provider = this.provider;
+    if (validAIID(this.model)) out.model = this.model;
+    if (validAIEffort(this.effort)) out.effort = this.effort;
+    return out;
+  }
+}
+function aiError(code, message, provider = null, fields = {}) {
+  return new AIProviderError(code, message, provider, fields);
+}
+function sanitizeAIText(value, limit) {
+  if (typeof value !== 'string') return '';
+  return [...value.replace(/[\p{Cc}\p{Cf}\u007f]/gu, ' ').replace(AI_BIDI, ' ')
+    .replace(/\s+/gu, ' ').trim()].slice(0, limit).join('');
+}
+function validAIID(value) {
+  return typeof value === 'string' && Buffer.byteLength(value, 'utf8') > 0 &&
+    Buffer.byteLength(value, 'utf8') <= 256 && value.length <= AI_MAX_RAW_STRING &&
+    !AI_FORBIDDEN_ID.test(value) && !AI_BIDI_TEST.test(value);
+}
+function validAIEffort(value) { return typeof value === 'string' && AI_EFFORT.test(value); }
+function byteCompare(a, b) { return Buffer.compare(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8')); }
+function decodeAIUTF8(bytes, provider, code = 'config_read_failed') {
+  try { return new TextDecoder('utf-8', { fatal: true }).decode(bytes); }
+  catch { throw aiError(code, `${AI_PROVIDER_META[provider].name} returned data Foldview could not read safely.`, provider); }
+}
+function canonicalExecutable(value) {
+  try {
+    if (!path.isAbsolute(value)) return null;
+    const stat = fs.statSync(value);
+    if (!stat.isFile()) return null;
+    fs.accessSync(value, fs.constants.X_OK);
+    return fs.realpathSync(value);
+  } catch { return null; }
+}
+function executableFile(value) { return typeof value === 'string' && path.isAbsolute(value) ? canonicalExecutable(value) : null; }
+function classifyAIProvider(executable) {
+  const target = canonicalExecutable(executable);
+  if (!target) return null;
+  const matches = discoverAIClis().filter(entry => entry.provider && canonicalExecutable(entry.executable) === target);
+  return matches.length === 1 ? matches[0].provider : null;
+}
+function providerConfigPath(provider, options = {}) {
+  const accountHome = options.home || os.userInfo().homedir;
+  if (provider === 'codex') {
+    const override = options.codexHome === undefined ? process.env.CODEX_HOME : options.codexHome;
+    const root = typeof override === 'string' && override.length && path.isAbsolute(override)
+      ? override : path.join(accountHome, '.codex');
+    return path.join(root, 'config.toml');
+  }
+  if (provider === 'kimi') return path.join(accountHome, '.kimi-code', 'config.toml');
+  throw aiError('unsupported_provider', `Provider ${sanitizeAIText(String(provider), 64)} is not supported.`);
+}
+function providerFailure(provider, executable, err) {
+  const meta = AI_PROVIDER_META[provider];
+  const safe = err instanceof AIProviderError ? err : aiError('malformed_catalog', `${meta.name} returned a model catalog Foldview could not read.`, provider);
+  return { id: provider, name: meta.name, executable: executable || null, available: false,
+    error: safe.toJSON(), defaultModel: null, defaultEffort: null, models: [] };
+}
+
+function normalizeEfforts(raw, provider = null) {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set(), out = [];
+  for (const effort of raw) {
+    if (!validAIEffort(effort) || seen.has(effort)) continue;
+    seen.add(effort); out.push(effort);
+    if (out.length > AI_MAX_EFFORTS) throw aiError('malformed_catalog', 'Provider reported too many effort levels.', provider);
+  }
+  return out;
+}
+function parseCodexCatalogPayload(input) {
+  const bytes = Buffer.isBuffer(input) ? input : Buffer.from(String(input), 'utf8');
+  if (bytes.length > AI_MAX_INPUT_BYTES) throw aiError('malformed_catalog', 'Codex returned a model catalog Foldview could not read.', 'codex');
+  let root;
+  try { root = JSON.parse(decodeAIUTF8(bytes, 'codex', 'malformed_catalog')); }
+  catch { throw aiError('malformed_catalog', 'Codex returned a model catalog Foldview could not read.', 'codex'); }
+  const entries = Array.isArray(root) ? root : (root && !Array.isArray(root) && Array.isArray(root.models) ? root.models : null);
+  if (!entries) throw aiError('malformed_catalog', 'Codex returned a model catalog Foldview could not read.', 'codex');
+  const seen = new Set(), rows = [];
+  for (const entry of entries) {
+    if (!entry || Array.isArray(entry) || typeof entry !== 'object') continue;
+    if (entry.visibility !== undefined && entry.visibility !== 'list') continue;
+    if (!validAIID(entry.slug) || seen.has(entry.slug)) continue;
+    if (entry.slug.length > AI_MAX_RAW_STRING) continue;
+    if (entry.supported_reasoning_levels !== undefined && !Array.isArray(entry.supported_reasoning_levels)) continue;
+    const rawEfforts = (entry.supported_reasoning_levels || []).flatMap(level =>
+      level && !Array.isArray(level) && typeof level === 'object' && typeof level.effort === 'string' ? [level.effort] : []);
+    const efforts = normalizeEfforts(rawEfforts, 'codex');
+    if (typeof entry.display_name === 'string' && Buffer.byteLength(entry.display_name, 'utf8') > AI_MAX_RAW_STRING ||
+        typeof entry.description === 'string' && Buffer.byteLength(entry.description, 'utf8') > AI_MAX_RAW_STRING) continue;
+    const rawLabel = typeof entry.display_name === 'string' ? entry.display_name : entry.slug;
+    const rawDetail = typeof entry.description === 'string' ? entry.description : 'Codex model';
+    const label = sanitizeAIText(rawLabel, 160) || entry.slug;
+    const detail = sanitizeAIText(rawDetail, 512) || 'Codex model';
+    const defaultEffort = validAIEffort(entry.default_reasoning_level) && efforts.includes(entry.default_reasoning_level)
+      ? entry.default_reasoning_level : null;
+    const priority = Number.isFinite(entry.priority) && Number.isInteger(entry.priority) ? entry.priority : 999;
+    seen.add(entry.slug);
+    rows.push({ id: entry.slug, label, detail, efforts, defaultEffort, priority });
+    if (rows.length > AI_MAX_MODELS) throw aiError('malformed_catalog', 'Codex reported too many models.', 'codex');
+  }
+  rows.sort((a, b) => a.priority - b.priority || byteCompare(a.label, b.label) || byteCompare(a.id, b.id));
+  return rows.map(({ priority, ...model }) => model);
+}
+
+function splitTomlLines(source) {
+  const out = [];
+  for (const match of source.matchAll(/([^\r\n]*)(\r\n|\n|$)/g)) {
+    if (!match[0]) break;
+    out.push({ body: match[1], eol: match[2] });
+    if (!match[2]) break;
+  }
+  if (!out.length) out.push({ body: '', eol: '' });
+  return out;
+}
+function tomlCommentIndex(line) {
+  let quote = null, escaped = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote === '"') {
+      if (escaped) { escaped = false; continue; }
+      if (ch === '\\') { escaped = true; continue; }
+      if (ch === '"') quote = null;
+    } else if (quote === "'") {
+      if (ch === "'") quote = null;
+    } else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === '#') return i;
+  }
+  return line.length;
+}
+function parseTomlString(token) {
+  if (typeof token !== 'string' || Buffer.byteLength(token, 'utf8') > AI_MAX_RAW_STRING || token.length < 2) return null;
+  if (token[0] !== '"' || token.at(-1) !== '"') return null;
+  let out = '';
+  for (let i = 1; i < token.length - 1; i++) {
+    const ch = token[i];
+    if (ch !== '\\') { if (ch === '"' || /[\r\n]/.test(ch)) return null; out += ch; continue; }
+    const next = token[++i];
+    const mapped = { '\\': '\\', '"': '"', n: '\n', r: '\r', t: '\t' }[next];
+    if (mapped === undefined) return null;
+    out += mapped;
+  }
+  return out;
+}
+function quoteTomlString(value) {
+  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t')}"`;
+}
+function parseTomlStringArray(token) {
+  if (typeof token !== 'string' || Buffer.byteLength(token, 'utf8') > AI_MAX_RAW_STRING || token[0] !== '[' || token.at(-1) !== ']') return null;
+  const values = []; let start = 1, quote = null, escaped = false;
+  for (let i = 1; i < token.length - 1; i++) {
+    const ch = token[i];
+    if (quote === '"') {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quote = null;
+    } else if (quote === "'") { if (ch === "'") quote = null; }
+    else if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === ',') {
+      const part = token.slice(start, i).trim();
+      if (!part) return null;
+      const value = parseTomlString(part); if (value === null) return null;
+      values.push(value); start = i + 1;
+    }
+  }
+  if (quote) return null;
+  const tail = token.slice(start, -1).trim();
+  if (tail) { const value = parseTomlString(tail); if (value === null) return null; values.push(value); }
+  return values;
+}
+function validOpaqueScalar(token) {
+  return /^(?:true|false|[+-]?(?:\d(?:_?\d)*)|[+-]?(?:\d(?:_?\d)*)?\.\d(?:_?\d)*(?:[eE][+-]?\d(?:_?\d)*)?|[+-]?(?:inf|nan)|\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?)?)$/.test(token);
+}
+function parseTomlKeySegments(rawKey) {
+  if (typeof rawKey !== 'string' || !rawKey.trim()) return null;
+  const segments = []; let start = 0, quote = false, escaped = false;
+  for (let i = 0; i <= rawKey.length; i++) {
+    const ch = rawKey[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quote = false;
+    } else if (ch === '"') quote = true;
+    else if (ch === "'") return null;
+    else if (ch === '.' || i === rawKey.length) {
+      const raw = rawKey.slice(start, i).trim();
+      if (!raw) return null;
+      const value = /^[A-Za-z0-9_-]+$/.test(raw) ? raw : parseTomlString(raw);
+      if (value === null) return null;
+      segments.push(value); start = i + 1;
+    }
+  }
+  return quote || escaped || !segments.length ? null : segments;
+}
+function splitTomlTopLevel(source, separator) {
+  const out = []; let start = 0, quote = false, escaped = false, square = 0, curly = 0;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quote = false;
+      continue;
+    }
+    if (ch === '"') { quote = true; continue; }
+    if (ch === "'") return null;
+    if (ch === '[') square++;
+    else if (ch === ']' && --square < 0) return null;
+    else if (ch === '{') curly++;
+    else if (ch === '}' && --curly < 0) return null;
+    else if (ch === separator && square === 0 && curly === 0) {
+      out.push(source.slice(start, i).trim()); start = i + 1;
+    }
+  }
+  if (quote || escaped || square || curly) return null;
+  out.push(source.slice(start).trim());
+  return out;
+}
+function topLevelTomlEquals(source) {
+  let quote = false, escaped = false, square = 0, curly = 0;
+  for (let i = 0; i < source.length; i++) {
+    const ch = source[i];
+    if (quote) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') quote = false;
+      continue;
+    }
+    if (ch === '"') { quote = true; continue; }
+    if (ch === '[') square++;
+    else if (ch === ']') square--;
+    else if (ch === '{') curly++;
+    else if (ch === '}') curly--;
+    else if (ch === '=' && square === 0 && curly === 0) return i;
+  }
+  return -1;
+}
+function validOpaqueTomlValue(token, depth = 0) {
+  if (!token || Buffer.byteLength(token, 'utf8') > AI_MAX_RAW_STRING || depth > 16) return false;
+  if (token.startsWith('"')) return parseTomlString(token) !== null;
+  if (token.startsWith("'")) return false;
+  if (validOpaqueScalar(token)) return true;
+  if (token.startsWith('[') && token.endsWith(']')) {
+    const parts = splitTomlTopLevel(token.slice(1, -1), ',');
+    if (!parts) return false;
+    if (parts.length === 1 && parts[0] === '') return true;
+    if (parts.at(-1) === '') parts.pop();
+    return parts.length > 0 && parts.every(part => part && validOpaqueTomlValue(part, depth + 1));
+  }
+  if (token.startsWith('{') && token.endsWith('}')) {
+    const parts = splitTomlTopLevel(token.slice(1, -1), ',');
+    if (!parts) return false;
+    if (parts.length === 1 && parts[0] === '') return true;
+    if (parts.at(-1) === '') return false; // TOML inline tables do not permit a trailing comma.
+    return parts.every(part => {
+      const eq = topLevelTomlEquals(part);
+      return eq > 0 && parseTomlKeySegments(part.slice(0, eq).trim()) !== null &&
+        validOpaqueTomlValue(part.slice(eq + 1).trim(), depth + 1);
+    });
+  }
+  return false;
+}
+function validSingleLineTomlValue(token) {
+  return validOpaqueTomlValue(token);
+}
+function parseTomlTableSegments(code) {
+  if (!code.startsWith('[') || !code.endsWith(']') || code.startsWith('[[') || code.endsWith(']]')) return null;
+  const inner = code.slice(1, -1).trim();
+  return inner ? parseTomlKeySegments(inner) : null;
+}
+function validTomlTableHeader(code) {
+  return parseTomlTableSegments(code) !== null;
+}
+function parseTomlSubset(source, provider) {
+  if (typeof source !== 'string' || Buffer.byteLength(source, 'utf8') > AI_MAX_INPUT_BYTES || source.startsWith('\ufeff') || /\r(?!\n)/.test(source) || /'''|"""/.test(source))
+    throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration could not be read safely.`, provider);
+  const lines = splitTomlLines(source);
+  const assignments = [], aliases = new Set(), modelAliases = [];
+  let table = null, firstTable = lines.length, thinkingSeen = false;
+  for (let index = 0; index < lines.length; index++) {
+    const body = lines[index].body;
+    const commentAt = tomlCommentIndex(body);
+    const code = body.slice(0, commentAt).trim();
+    if (!code) continue;
+    if (code.startsWith('[')) {
+      const tableSegments = parseTomlTableSegments(code);
+      if (!tableSegments) throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration uses an unsupported multiline or table value.`, provider);
+      if (firstTable === lines.length) firstTable = index;
+      if (tableSegments[0] === 'thinking') {
+        if (tableSegments.length !== 1 || code !== '[thinking]') throw aiError('config_read_failed', 'Kimi Code configuration contains an unsupported thinking table.', provider);
+        if (thinkingSeen) throw aiError('config_read_failed', 'Kimi Code configuration contains duplicate thinking tables.', provider);
+        thinkingSeen = true; table = { kind: 'thinking' }; continue;
+      }
+      if (tableSegments[0] === 'models') {
+        if (tableSegments.length !== 2) throw aiError('config_read_failed', 'Kimi Code configuration uses an unsupported models table.', provider);
+        const alias = tableSegments[1];
+        if (code !== `[models.${quoteTomlString(alias)}]`) throw aiError('config_read_failed', 'Kimi Code configuration uses an unsupported models table.', provider);
+        if (!validAIID(alias) || aliases.has(alias)) throw aiError('config_read_failed', 'Kimi Code configuration contains an invalid or duplicate model alias.', provider);
+        aliases.add(alias); modelAliases.push(alias); table = { kind: 'model', alias }; continue;
+      }
+      table = { kind: 'unknown', name: tableSegments.join('.'), segments: tableSegments }; continue;
+    }
+    const eq = code.indexOf('=');
+    if (eq <= 0) throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration contains an unsupported line.`, provider);
+    const rawKey = code.slice(0, eq).trim();
+    const keySegments = parseTomlKeySegments(rawKey);
+    if (!keySegments)
+      throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration contains an invalid key.`, provider);
+    const exactTargets = new Set(provider === 'codex' ? ['model', 'model_reasoning_effort'] : ['default_model', 'effort', 'enabled']);
+    if (keySegments.length > 1 && exactTargets.has(keySegments[0]))
+      throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration contains an unsupported target key.`, provider);
+    if (table?.kind === 'thinking' && keySegments.length > 1 && ['enabled', 'effort', 'default_effort'].includes(keySegments[0]))
+      throw aiError('config_read_failed', 'Kimi Code configuration contains an unsupported thinking setting.', provider);
+    const semanticKey = keySegments.length === 1 ? keySegments[0] : null;
+    const topTarget = !table && (provider === 'codex'
+      ? ['model', 'model_reasoning_effort'].includes(semanticKey)
+      : semanticKey === 'default_model');
+    const thinkingTarget = table?.kind === 'thinking' && ['enabled', 'effort', 'default_effort'].includes(semanticKey);
+    const modelTargetKey = table?.kind === 'model' && ['model', 'display_name', 'capabilities', 'support_efforts', 'default_effort'].includes(semanticKey);
+    if ((topTarget || thinkingTarget || modelTargetKey) && rawKey !== semanticKey)
+      throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration contains a quoted target key outside Foldview's accepted subset.`, provider);
+    const eqBody = body.indexOf('=');
+    let valueStart = eqBody + 1;
+    while (valueStart < commentAt && /\s/.test(body[valueStart])) valueStart++;
+    let valueEnd = commentAt;
+    while (valueEnd > valueStart && /\s/.test(body[valueEnd - 1])) valueEnd--;
+    const token = body.slice(valueStart, valueEnd);
+    if (!validSingleLineTomlValue(token)) throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration uses an unsupported multiline or value form.`, provider);
+    const canonicalKey = semanticKey ?? rawKey;
+    if (table?.kind === 'thinking' && canonicalKey === 'default_effort')
+      throw aiError('config_read_failed', 'Kimi Code configuration contains an unsupported thinking setting.', provider);
+    assignments.push({ index, key: canonicalKey, keySegments, token, valueStart, valueEnd, table });
+  }
+  const targetSeen = new Set();
+  for (const a of assignments) {
+    const target = provider === 'codex'
+      ? (!a.table && ['model', 'model_reasoning_effort'].includes(a.key))
+      : ((!a.table && a.key === 'default_model') || a.table?.kind === 'thinking' && ['enabled', 'effort'].includes(a.key));
+    if (target) {
+      const identity = `${a.table?.kind || 'top'}:${a.key}`;
+      if (targetSeen.has(identity)) throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration contains a duplicate target setting.`, provider);
+      targetSeen.add(identity);
+    }
+    const modelTarget = a.table?.kind === 'model' && ['model', 'display_name', 'capabilities', 'support_efforts', 'default_effort'].includes(a.key);
+    if (modelTarget) {
+      const identity = `model:${a.table.alias}:${a.key}`;
+      if (targetSeen.has(identity)) throw aiError('config_read_failed', 'Kimi Code configuration contains a duplicate model setting.', provider);
+      targetSeen.add(identity);
+      const valid = ['capabilities', 'support_efforts'].includes(a.key)
+        ? parseTomlStringArray(a.token) !== null : parseTomlString(a.token) !== null;
+      if (!valid) throw aiError('config_read_failed', 'Kimi Code configuration contains an invalid model setting.', provider);
+    }
+    if (provider === 'codex' && !a.table && ['model', 'model_reasoning_effort'].includes(a.key) && parseTomlString(a.token) === null)
+      throw aiError('config_read_failed', 'Codex configuration contains an invalid model setting.', provider);
+    if (provider === 'kimi' && !a.table && a.key === 'default_model' && parseTomlString(a.token) === null)
+      throw aiError('config_read_failed', 'Kimi Code configuration contains an invalid default model.', provider);
+    if (provider === 'kimi' && a.table?.kind === 'thinking' && a.key === 'effort' && parseTomlString(a.token) === null)
+      throw aiError('config_read_failed', 'Kimi Code configuration contains an invalid thinking effort.', provider);
+    if (provider === 'kimi' && a.table?.kind === 'thinking' && a.key === 'enabled' && !['true', 'false'].includes(a.token))
+      throw aiError('config_read_failed', 'Kimi Code configuration contains an invalid thinking state.', provider);
+  }
+  return { source, lines, assignments, modelAliases, firstTable, lineEnding: source.includes('\r\n') ? '\r\n' : '\n' };
+}
+function assignmentString(doc, key, tableKind = null) {
+  const a = doc.assignments.find(row => row.key === key && (row.table?.kind || null) === tableKind);
+  return a ? parseTomlString(a.token) : null;
+}
+function assignmentBool(doc, key, tableKind) {
+  const a = doc.assignments.find(row => row.key === key && row.table?.kind === tableKind);
+  return a?.token === 'true' ? true : a?.token === 'false' ? false : null;
+}
+function parseKimiCatalogSource(source) {
+  let doc;
+  try { doc = parseTomlSubset(source, 'kimi'); }
+  catch (err) {
+    if (err instanceof AIProviderError) { err.code = 'malformed_catalog'; throw err; }
+    throw err;
+  }
+  const models = [];
+  for (const alias of doc.modelAliases) {
+    const rows = doc.assignments.filter(a => a.table?.kind === 'model' && a.table.alias === alias);
+    const str = key => { const a = rows.find(r => r.key === key); return a ? parseTomlString(a.token) : null; };
+    const arr = key => { const a = rows.find(r => r.key === key); return a ? parseTomlStringArray(a.token) : null; };
+    const capabilities = arr('capabilities') || [];
+    const efforts = normalizeEfforts(arr('support_efforts') || [], 'kimi');
+    const rawLabel = str('display_name') || str('model') || alias;
+    const label = sanitizeAIText(rawLabel, 160) || alias;
+    const fixedThinking = capabilities.includes('thinking') && efforts.length === 0;
+    const defaultRaw = str('default_effort');
+    const defaultEffort = validAIEffort(defaultRaw) && efforts.includes(defaultRaw) ? defaultRaw : null;
+    models.push({ id: alias, label, detail: fixedThinking ? 'Thinking is always on' : 'Kimi managed model', efforts, defaultEffort });
+    if (models.length > AI_MAX_MODELS) throw aiError('malformed_catalog', 'Kimi Code configuration declares too many models.', 'kimi');
+  }
+  if (!models.length) throw aiError('malformed_catalog', 'Kimi Code configuration does not declare any usable models.', 'kimi');
+  const rawDefault = assignmentString(doc, 'default_model');
+  const defaultModel = models.some(m => m.id === rawDefault) ? rawDefault : null;
+  const enabled = assignmentBool(doc, 'enabled', 'thinking') === true;
+  const effortRaw = assignmentString(doc, 'effort', 'thinking');
+  const defaultEntry = models.find(m => m.id === defaultModel);
+  const defaultEffort = enabled && defaultEntry && validAIEffort(effortRaw) && defaultEntry.efforts.includes(effortRaw) ? effortRaw : null;
+  return { doc, models, defaultModel, defaultEffort, thinkingEnabled: enabled, configuredEffort: effortRaw };
+}
+
+function safeConfigRead(file, provider, changed = false) {
+  const fail = () => { throw aiError(changed ? 'config_changed' : 'config_read_failed',
+    changed ? `${AI_PROVIDER_META[provider].name} configuration changed during the save.` : `${AI_PROVIDER_META[provider].name} configuration could not be read safely.`, provider); };
+  let lst;
+  try { lst = fs.lstatSync(file, { bigint: true }); }
+  catch (err) { if (err?.code === 'ENOENT') return { missing: true, content: Buffer.alloc(0), identity: 'missing', mode: 0o600 }; fail(); }
+  const uid = typeof process.geteuid === 'function' ? BigInt(process.geteuid()) : lst.uid;
+  if (!lst.isFile() || lst.nlink !== 1n || lst.uid !== uid || (Number(lst.mode) & 0o400) === 0 || (Number(lst.mode) & 0o077) !== 0 || lst.size > BigInt(AI_MAX_INPUT_BYTES)) fail();
+  let fd;
+  try {
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (!st.isFile() || st.dev !== lst.dev || st.ino !== lst.ino || st.uid !== lst.uid || st.mode !== lst.mode || st.size !== lst.size || st.mtimeNs !== lst.mtimeNs) fail();
+    const content = fs.readFileSync(fd);
+    if (content.length > AI_MAX_INPUT_BYTES) fail();
+    const identity = [st.dev, st.ino, st.uid, st.mode, st.size, st.mtimeNs, crypto.createHash('sha256').update(content).digest('hex')].join(':');
+    return { missing: false, content, identity, mode: Number(st.mode) & 0o777, stat: st };
+  } catch { fail(); }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
+function configSnapshotEqual(a, b) { return a.missing === b.missing && a.identity === b.identity; }
+function readAIProviderDefaults(provider, options = {}) {
+  if (!AI_PROVIDER_META[provider]) throw aiError('unsupported_provider', `Provider ${sanitizeAIText(String(provider), 64)} is not supported.`);
+  const snap = options.snapshot || safeConfigRead(providerConfigPath(provider, options), provider);
+  if (snap.missing) return { provider, defaultModel: null, defaultEffort: null };
+  const source = decodeAIUTF8(snap.content, provider);
+  try {
+    if (provider === 'codex') {
+      const doc = parseTomlSubset(source, provider);
+      const model = assignmentString(doc, 'model');
+      const effort = assignmentString(doc, 'model_reasoning_effort');
+      return { provider, defaultModel: validAIID(model) ? model : null, defaultEffort: validAIEffort(effort) ? effort : null };
+    }
+    const parsed = parseKimiCatalogSource(source);
+    return { provider, defaultModel: parsed.defaultModel, defaultEffort: parsed.defaultEffort };
+  } catch (err) {
+    if (err instanceof AIProviderError) { err.code = 'config_read_failed'; throw err; }
+    throw aiError('config_read_failed', `${AI_PROVIDER_META[provider].name} configuration could not be read safely.`, provider);
+  }
+}
+
+async function runBoundedCatalog(executable, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 5000, limit = options.limit ?? AI_MAX_INPUT_BYTES;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'foldview-ai-'));
+  fs.chmodSync(dir, 0o700);
+  const outPath = path.join(dir, 'stdout'), errPath = path.join(dir, 'stderr');
+  const outFd = fs.openSync(outPath, 'wx', 0o600), errFd = fs.openSync(errPath, 'wx', 0o600);
+  let child, timer, poll, killedFor = null;
+  try {
+    child = spawn(executable, ['debug', 'models'], { stdio: ['ignore', outFd, errFd], detached: true });
+    const closed = new Promise(resolve => { child.once('close', (code, signal) => resolve({ code, signal })); child.once('error', () => resolve({ code: null, signal: null })); });
+    const killGroup = reason => {
+      if (killedFor) return; killedFor = reason;
+      try { process.kill(-child.pid, 'SIGTERM'); } catch { try { child.kill('SIGTERM'); } catch {} }
+      setTimeout(() => { if (child.exitCode === null && child.signalCode === null) try { process.kill(-child.pid, 'SIGKILL'); } catch { try { child.kill('SIGKILL'); } catch {} } }, 250).unref?.();
+    };
+    timer = setTimeout(() => killGroup('timeout'), timeoutMs);
+    poll = setInterval(() => {
+      try { if (fs.fstatSync(outFd).size + fs.fstatSync(errFd).size > limit) killGroup('limit'); } catch {}
+    }, 20);
+    const result = await closed;
+    clearTimeout(timer); clearInterval(poll);
+    fs.closeSync(outFd); fs.closeSync(errFd);
+    const total = fs.statSync(outPath).size + fs.statSync(errPath).size;
+    if (killedFor === 'timeout') throw aiError('catalog_timeout', 'Codex model catalog probe timed out.', 'codex');
+    if (killedFor === 'limit' || total > limit) throw aiError('malformed_catalog', 'Codex returned a model catalog Foldview could not read.', 'codex');
+    if (result.code !== 0) throw aiError('provider_unavailable', 'Codex could not provide its model catalog.', 'codex');
+    return fs.readFileSync(outPath);
+  } finally {
+    if (timer) clearTimeout(timer); if (poll) clearInterval(poll);
+    try { fs.closeSync(outFd); } catch {} try { fs.closeSync(errFd); } catch {}
+    try { fs.rmSync(dir, { recursive: true }); } catch {}
+  }
+}
+async function loadCodexCatalog(executable, options = {}) {
+  const canonical = canonicalExecutable(executable);
+  if (!canonical) throw aiError('provider_unavailable', 'Codex is not installed or executable.', 'codex');
+  const models = parseCodexCatalogPayload(await runBoundedCatalog(canonical, options));
+  if (!models.length) throw aiError('malformed_catalog', 'Codex returned no usable models.', 'codex');
+  let defaults = { defaultModel: null, defaultEffort: null };
+  try { defaults = readAIProviderDefaults('codex', options); }
+  catch (err) { if (err.code !== 'config_read_failed') throw err; else throw err; }
+  const defaultModel = models.some(m => m.id === defaults.defaultModel) ? defaults.defaultModel : null;
+  const selected = models.find(m => m.id === defaultModel);
+  const defaultEffort = selected && selected.efforts.includes(defaults.defaultEffort) ? defaults.defaultEffort : null;
+  return { models, defaultModel, defaultEffort };
+}
+async function loadKimiCatalog(executable, options = {}) {
+  const canonical = canonicalExecutable(executable);
+  if (!canonical) throw aiError('provider_unavailable', 'Kimi Code is not installed or executable.', 'kimi');
+  const snap = safeConfigRead(providerConfigPath('kimi', options), 'kimi');
+  if (snap.missing) throw aiError('provider_unavailable', 'Kimi Code configuration is not available.', 'kimi');
+  return parseKimiCatalogSource(decodeAIUTF8(snap.content, 'kimi', 'malformed_catalog'));
+}
+async function buildAIProviderCatalog(providerFilter = null, options = {}) {
+  if (providerFilter !== null && !AI_PROVIDER_META[providerFilter]) throw aiError('unsupported_provider', `Provider ${sanitizeAIText(String(providerFilter), 64)} is not supported.`);
+  const ids = providerFilter ? [providerFilter] : ['codex', 'kimi'];
+  const discovered = discoverAIClis();
+  const providers = [];
+  for (const provider of ids) {
+    const entry = discovered.find(item => item.provider === provider);
+    const executable = entry?.executable || null;
+    if (!executable) { providers.push(providerFailure(provider, null, aiError('provider_unavailable', `${AI_PROVIDER_META[provider].name} is not installed or executable.`, provider))); continue; }
+    try {
+      const loaded = provider === 'codex' ? await loadCodexCatalog(executable, options) : await loadKimiCatalog(executable, options);
+      providers.push({ id: provider, name: AI_PROVIDER_META[provider].name, executable, available: true, error: null,
+        defaultModel: loaded.defaultModel, defaultEffort: loaded.defaultEffort, models: loaded.models });
+    } catch (err) { providers.push(providerFailure(provider, executable, err)); }
+  }
+  return { schemaVersion: 1, generatedAt: (options.now || new Date()).toISOString(), providers };
+}
+function validateAISelection(provider, catalog, model, effort) {
+  if (!AI_PROVIDER_META[provider]) throw aiError('unsupported_provider', `Provider ${sanitizeAIText(String(provider), 64)} is not supported.`);
+  const providerCatalog = Array.isArray(catalog?.providers) ? catalog.providers.find(p => p.id === provider) : catalog;
+  if (providerCatalog?.available !== true) throw aiError('provider_unavailable', `${AI_PROVIDER_META[provider].name} is unavailable.`, provider);
+  const models = providerCatalog.models || [];
+  const effectiveModel = model ?? providerCatalog.defaultModel;
+  const selected = models.find(m => m.id === effectiveModel);
+  if (model !== null && model !== undefined && !selected) throw aiError('unsupported_model', `Model ${sanitizeAIText(String(model), 96)} is not available for ${AI_PROVIDER_META[provider].name}.`, provider, { model });
+  if (effort !== null && effort !== undefined) {
+    if (!selected || !selected.efforts.includes(effort)) throw aiError('unsupported_effort', `Effort ${sanitizeAIText(String(effort), 64)} is not supported by ${sanitizeAIText(String(effectiveModel || 'the selected model'), 96)}.`, provider, { model: effectiveModel, effort });
+  }
+  return { provider, model: model ?? null, effort: effort ?? null, selectedModel: selected || null };
+}
+function availableProviderCatalog(envelope, provider) {
+  const entry = envelope?.providers?.find(item => item.id === provider);
+  if (entry?.available === true) return entry;
+  const reported = entry?.error;
+  throw aiError(reported?.code || 'provider_unavailable',
+    reported?.message || `${AI_PROVIDER_META[provider]?.name || 'Provider'} is unavailable.`, provider,
+    { model: reported?.model, effort: reported?.effort });
+}
+async function prepareAIValidatedLaunch(cliPath, requestedProvider, model, effort, options = {}) {
+  if (!executableFile(cliPath)) throw aiError('provider_unavailable', 'The selected AI CLI is not a regular executable file.', requestedProvider);
+  const classify = options.classify || classifyAIProvider;
+  const catalogBuilder = options.catalogBuilder || buildAIProviderCatalog;
+  const classified = classify(cliPath);
+  if (!classified || (requestedProvider && classified !== requestedProvider))
+    throw aiError('provider_mismatch', 'The selected provider does not match the resolved executable.', requestedProvider);
+  let providerCatalog = null;
+  if (model !== null || effort !== null) {
+    const envelope = await catalogBuilder(classified);
+    providerCatalog = availableProviderCatalog(envelope, classified);
+    try { validateAISelection(classified, providerCatalog, model, effort); }
+    catch (err) { if (err instanceof AIProviderError) err.providerCatalog = providerCatalog; throw err; }
+  }
+  return { provider: classified, providerCatalog, launchSpec: { provider: classified, model, effort } };
+}
+function buildAIProviderLaunch(provider, executable, model = null, effort = null) {
+  if (!provider) return { env: [], argv: [executable] };
+  if (!AI_PROVIDER_META[provider]) throw aiError('unsupported_provider', `Provider ${sanitizeAIText(String(provider), 64)} is not supported.`);
+  const argv = [executable], env = [];
+  if (provider === 'codex') {
+    if (model !== null) argv.push('--model', model);
+    if (effort !== null) argv.push('--config', `model_reasoning_effort="${effort}"`);
+  } else {
+    if (effort !== null) env.push({ name: 'KIMI_MODEL_THINKING_EFFORT', value: effort });
+    if (model !== null) argv.push('--model', model);
+  }
+  return { env, argv };
+}
+function insertTomlLines(lines, index, bodies, lineEnding) {
+  if (!bodies.length) return;
+  if (lines.length === 1 && lines[0].body === '' && lines[0].eol === '') {
+    lines.splice(0, 1, ...bodies.map((body, offset) => ({
+      body, eol: offset === bodies.length - 1 ? '' : lineEnding,
+    })));
+    return;
+  }
+  if (index > 0 && !lines[index - 1].eol) lines[index - 1].eol = lineEnding;
+  const atEnd = index === lines.length;
+  const additions = bodies.map((body, offset) => ({
+    body,
+    eol: atEnd && offset === bodies.length - 1 ? '' : lineEnding,
+  }));
+  lines.splice(index, 0, ...additions);
+}
+function mutateProviderDefaults(doc, provider, model, selectedModel, requestedEffort) {
+  const explicitEffort = requestedEffort !== undefined && requestedEffort !== null;
+  const configured = provider === 'codex'
+    ? assignmentString(doc, 'model_reasoning_effort')
+    : assignmentString(doc, 'effort', 'thinking');
+  const effectiveEffort = explicitEffort ? requestedEffort
+    : selectedModel.efforts.includes(configured) ? configured
+      : selectedModel.defaultEffort && selectedModel.efforts.includes(selectedModel.defaultEffort) ? selectedModel.defaultEffort : null;
+  const lines = doc.lines.map(line => ({ ...line }));
+  const removals = new Set(), replacements = new Map();
+  const find = (key, kind = null) => doc.assignments.find(a => a.key === key && (a.table?.kind || null) === kind);
+  const replace = (a, value) => replacements.set(a.index,
+    lines[a.index].body.slice(0, a.valueStart) + value + lines[a.index].body.slice(a.valueEnd));
+  const setExisting = (key, kind, value, remove = false) => {
+    const a = find(key, kind);
+    if (a && remove) removals.add(a.index);
+    else if (a) replace(a, value);
+    return !!a;
+  };
+  if (provider === 'codex') {
+    const additions = [];
+    if (!setExisting('model', null, quoteTomlString(model))) additions.push(`model = ${quoteTomlString(model)}`);
+    if (effectiveEffort === null) setExisting('model_reasoning_effort', null, '', true);
+    else if (!setExisting('model_reasoning_effort', null, quoteTomlString(effectiveEffort))) additions.push(`model_reasoning_effort = ${quoteTomlString(effectiveEffort)}`);
+    for (const [i, body] of replacements) lines[i].body = body;
+    for (const i of [...removals].sort((a, b) => b - a)) lines.splice(i, 1);
+    if (additions.length) {
+      const firstTable = lines.findIndex(line => line.body.trimStart().startsWith('['));
+      insertTomlLines(lines, firstTable < 0 ? lines.length : firstTable, additions, doc.lineEnding);
+    }
+  } else {
+    const topAdditions = [];
+    if (!setExisting('default_model', null, quoteTomlString(model))) topAdditions.push(`default_model = ${quoteTomlString(model)}`);
+    if (effectiveEffort === null) setExisting('effort', 'thinking', '', true);
+    else setExisting('effort', 'thinking', quoteTomlString(effectiveEffort));
+    if (explicitEffort) setExisting('enabled', 'thinking', 'true');
+    for (const [i, body] of replacements) lines[i].body = body;
+    for (const i of [...removals].sort((a, b) => b - a)) lines.splice(i, 1);
+    if (topAdditions.length) {
+      const firstTable = lines.findIndex(line => line.body.trimStart().startsWith('['));
+      insertTomlLines(lines, firstTable < 0 ? lines.length : firstTable, topAdditions, doc.lineEnding);
+    }
+    if (effectiveEffort !== null && !find('effort', 'thinking') || explicitEffort && !find('enabled', 'thinking')) {
+      let header = lines.findIndex(line => line.body.trim() === '[thinking]');
+      const missing = [];
+      if (effectiveEffort !== null && !find('effort', 'thinking')) missing.push(`effort = ${quoteTomlString(effectiveEffort)}`);
+      if (explicitEffort && !find('enabled', 'thinking')) missing.unshift('enabled = true');
+      if (header < 0) {
+        if (lines.length && lines.at(-1).body !== '') {
+          if (!lines.at(-1).eol) lines.at(-1).eol = doc.lineEnding;
+          lines.push({ body: '', eol: doc.lineEnding });
+        }
+        insertTomlLines(lines, lines.length, ['[thinking]', ...missing], doc.lineEnding);
+      } else {
+        let end = header + 1;
+        while (end < lines.length && !lines[end].body.trimStart().startsWith('[')) end++;
+        insertTomlLines(lines, end, missing, doc.lineEnding);
+      }
+    }
+  }
+  return { source: lines.map(line => line.body + line.eol).join(''), effectiveEffort };
+}
+function verifyWritableParent(file, provider) {
+  const parent = path.dirname(file);
+  let st;
+  try { st = fs.lstatSync(parent, { bigint: true }); } catch { throw aiError('config_write_failed', `${AI_PROVIDER_META[provider].name} configuration directory is not writable safely.`, provider); }
+  const uid = typeof process.geteuid === 'function' ? BigInt(process.geteuid()) : st.uid;
+  const mode = Number(st.mode);
+  if (!st.isDirectory() || st.uid !== uid || (mode & 0o300) !== 0o300 || (mode & 0o022) !== 0)
+    throw aiError('config_write_failed', `${AI_PROVIDER_META[provider].name} configuration directory is not writable safely.`, provider);
+  return parent;
+}
+function inspectBreakableStaleLock(lockPath) {
+  let fd;
+  try {
+    const lst = fs.lstatSync(lockPath, { bigint: true });
+    const uid = typeof process.geteuid === 'function' ? BigInt(process.geteuid()) : lst.uid;
+    if (!lst.isFile() || lst.nlink !== 1n || lst.uid !== uid || lst.size > 1024n) return false;
+    fd = fs.openSync(lockPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const st = fs.fstatSync(fd, { bigint: true });
+    if (st.dev !== lst.dev || st.ino !== lst.ino) return false;
+    const parsed = JSON.parse(fs.readFileSync(fd, 'utf8'));
+    if (!Number.isInteger(parsed.pid) || parsed.pid <= 0 || typeof parsed.createdAt !== 'string') return false;
+    const created = Date.parse(parsed.createdAt);
+    if (!Number.isFinite(created) || Date.now() - created < 10 * 60 * 1000) return false;
+    try { process.kill(parsed.pid, 0); return null; }
+    catch (err) { return err?.code === 'ESRCH' ? { dev: st.dev, ino: st.ino } : null; }
+  } catch { return null; }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
+function createProviderLockFile(lockPath) {
+  const fd = fs.openSync(lockPath, 'wx', 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, createdAt: new Date().toISOString() }) + '\n');
+    fs.fsyncSync(fd);
+    const st = fs.fstatSync(fd, { bigint: true });
+    return { path: lockPath, fd, dev: st.dev, ino: st.ino };
+  } catch (err) {
+    let owned = null; try { owned = fs.fstatSync(fd, { bigint: true }); } catch {}
+    try { fs.closeSync(fd); } catch {}
+    try { const at = fs.lstatSync(lockPath, { bigint: true }); if (owned && at.dev === owned.dev && at.ino === owned.ino) fs.unlinkSync(lockPath); } catch {}
+    throw err;
+  }
+}
+function safeExistingReaperGuard(guardPath) {
+  try {
+    const st = fs.lstatSync(guardPath, { bigint: true });
+    const uid = typeof process.geteuid === 'function' ? BigInt(process.geteuid()) : st.uid;
+    return st.isFile() && st.nlink === 1n && st.uid === uid && st.size <= 1024n;
+  } catch (err) { return err?.code === 'ENOENT'; }
+}
+function acquireReaperGuard(guardPath, options = {}) {
+  // shlock's dot-lock algorithm atomically replaces only dead-PID guards. Without it, Foldview
+  // waits for the bounded main-lock deadline rather than deleting an orphan unsafely.
+  const shlockPath = options.shlockPath === undefined ? '/usr/bin/shlock' : options.shlockPath;
+  if (process.platform !== 'darwin' || !shlockPath || !safeExistingReaperGuard(guardPath)) return null;
+  let acquired = null;
+  try {
+    fs.accessSync(shlockPath, fs.constants.X_OK);
+    execFileSync(shlockPath, ['-f', guardPath, '-p', String(process.pid)], {
+      timeout: 500, stdio: ['ignore', 'ignore', 'ignore'],
+    });
+    const st = fs.lstatSync(guardPath, { bigint: true });
+    const uid = typeof process.geteuid === 'function' ? BigInt(process.geteuid()) : st.uid;
+    acquired = { path: guardPath, dev: st.dev, ino: st.ino, uid: st.uid };
+    if (!st.isFile() || st.nlink !== 1n || st.uid !== uid || st.size > 1024n) { releaseReaperGuard(acquired); return null; }
+    fs.chmodSync(guardPath, 0o600);
+    const content = fs.readFileSync(guardPath, 'utf8').trim();
+    if (content !== String(process.pid)) { releaseReaperGuard(acquired); return null; }
+    return acquired;
+  } catch { releaseReaperGuard(acquired); return null; }
+}
+function releaseReaperGuard(guard) {
+  if (!guard) return;
+  try {
+    const at = fs.lstatSync(guard.path, { bigint: true });
+    if (at.isFile() && at.dev === guard.dev && at.ino === guard.ino && at.uid === guard.uid) fs.unlinkSync(guard.path);
+  } catch {}
+}
+function reapStaleLockAndAcquire(lockPath, options = {}) {
+  const guardPath = lockPath + '.reap';
+  let guard;
+  try {
+    guard = acquireReaperGuard(guardPath, options);
+    if (!guard) return null;
+    if (typeof options.onReaperGuardAcquired === 'function') options.onReaperGuardAcquired(guardPath);
+    const owned = fs.lstatSync(guardPath, { bigint: true });
+    if (owned.dev !== guard.dev || owned.ino !== guard.ino || owned.uid !== guard.uid) return null;
+    const stale = inspectBreakableStaleLock(lockPath);
+    if (!stale) return null;
+    if (typeof options.onStaleLockVerified === 'function') options.onStaleLockVerified(lockPath);
+    const current = fs.lstatSync(lockPath, { bigint: true });
+    if (current.dev !== stale.dev || current.ino !== stale.ino) return null;
+    fs.unlinkSync(lockPath);
+    // Keep the reaper guard until this process has exclusively installed its own lock. Every
+    // Foldview writer checks the guard, so a cooperating contender cannot steal the gap.
+    return createProviderLockFile(lockPath);
+  } catch { return null; }
+  finally { releaseReaperGuard(guard); }
+}
+async function acquireProviderLock(file, provider, options = {}) {
+  const lockPath = file + '.foldview.lock', guardPath = lockPath + '.reap';
+  const started = Date.now(), timeoutMs = options.lockTimeoutMs ?? 2000;
+  while (Date.now() - started <= timeoutMs) {
+    try {
+      // A reaper owns the creation gap. Checking first plus the reaper's post-guard identity check
+      // ensures either this writer wins before inspection or waits until the stale lock is replaced.
+      if (fs.existsSync(guardPath)) throw Object.assign(new Error('reaper active'), { code: 'EEXIST' });
+      return createProviderLockFile(lockPath);
+    } catch (err) {
+      if (err?.code !== 'EEXIST') throw aiError('config_write_failed', `${AI_PROVIDER_META[provider].name} configuration lock could not be created.`, provider);
+      const reaped = reapStaleLockAndAcquire(lockPath, options);
+      if (reaped) return reaped;
+      if (Date.now() - started >= timeoutMs) break;
+      await new Promise(resolve => setTimeout(resolve, Math.min(40, Math.max(1, timeoutMs - (Date.now() - started)))));
+    }
+  }
+  throw aiError('config_locked', `${AI_PROVIDER_META[provider].name} configuration is being changed by another Foldview process.`, provider);
+}
+function releaseProviderLock(lock) {
+  try { fs.closeSync(lock.fd); } catch {}
+  try {
+    const st = fs.lstatSync(lock.path, { bigint: true });
+    if (st.dev === lock.dev && st.ino === lock.ino) fs.unlinkSync(lock.path);
+  } catch {}
+}
+function exclusiveSibling(file, stem, mode, content, provider, max = 1) {
+  for (let i = 0; i < max; i++) {
+    const candidate = file + stem + (i ? `-${i}` : '');
+    let fd, created = false;
+    try {
+      fd = fs.openSync(candidate, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), mode);
+      created = true;
+      fs.writeFileSync(fd, content); fs.fsyncSync(fd); fs.closeSync(fd);
+      return candidate;
+    } catch (err) {
+      if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+      if (created) try { fs.unlinkSync(candidate); } catch {}
+      if (err?.code === 'EEXIST' && i + 1 < max) continue;
+      throw aiError('config_write_failed', `${AI_PROVIDER_META[provider].name} configuration could not be saved safely.`, provider);
+    }
+  }
+  throw aiError('config_write_failed', `${AI_PROVIDER_META[provider].name} configuration could not be saved safely.`, provider);
+}
+async function writeAIProviderDefaults(provider, model, effort, options = {}) {
+  if (!AI_PROVIDER_META[provider]) throw aiError('unsupported_provider', `Provider ${sanitizeAIText(String(provider), 64)} is not supported.`);
+  if (!validAIID(model)) throw aiError('unsupported_model', 'The selected model ID is invalid.', provider);
+  if (effort !== undefined && effort !== null && !validAIEffort(effort)) throw aiError('unsupported_effort', 'The selected effort is invalid.', provider, { model, effort });
+  const file = providerConfigPath(provider, options);
+  const initial = safeConfigRead(file, provider);
+  if (!initial.missing) readAIProviderDefaults(provider, { ...options, snapshot: initial });
+  if (provider === 'kimi' && initial.missing) throw aiError('provider_unavailable', 'Kimi Code configuration is not available.', provider);
+  verifyWritableParent(file, provider);
+  const lock = await acquireProviderLock(file, provider, options);
+  let tempPath = null, renamed = false;
+  try {
+    const locked = safeConfigRead(file, provider, true);
+    if (!configSnapshotEqual(initial, locked)) throw aiError('config_changed', `${AI_PROVIDER_META[provider].name} configuration changed during the save.`, provider);
+    let parsed, providerCatalog;
+    if (provider === 'kimi') {
+      try { parsed = parseKimiCatalogSource(decodeAIUTF8(locked.content, 'kimi', 'config_changed')); }
+      catch (err) { if (err instanceof AIProviderError) err.code = 'config_changed'; throw err; }
+      providerCatalog = { available: true, defaultModel: parsed.defaultModel, defaultEffort: parsed.defaultEffort, models: parsed.models };
+    } else {
+      const source = locked.missing ? '' : decodeAIUTF8(locked.content, 'codex', 'config_changed');
+      try { parsed = { doc: parseTomlSubset(source, provider) }; }
+      catch (err) { if (err instanceof AIProviderError) err.code = 'config_changed'; throw err; }
+      const loader = typeof options.loadCatalog === 'function' ? options.loadCatalog : async () => {
+        const entry = discoverAIClis().find(item => item.provider === 'codex');
+        if (!entry) throw aiError('provider_unavailable', 'Codex is not installed or executable.', provider);
+        return loadCodexCatalog(entry.executable, options);
+      };
+      const externalCatalog = await loader();
+      providerCatalog = { available: true, defaultModel: externalCatalog.defaultModel, defaultEffort: externalCatalog.defaultEffort, models: externalCatalog.models };
+    }
+    const selection = validateAISelection(provider, providerCatalog, model, effort);
+    const transformed = mutateProviderDefaults(parsed.doc, provider, model, selection.selectedModel, effort);
+    const target = Buffer.from(transformed.source, 'utf8');
+    const mode = locked.missing ? 0o600 : locked.mode & 0o700;
+    if (!locked.missing) {
+      const stamp = (options.now || new Date()).toISOString().replace(/[:]/g, '-');
+      exclusiveSibling(file, `.foldview-backup-${stamp}`, mode, locked.content, provider, 1000);
+    }
+    const nonce = crypto.randomBytes(16).toString('hex');
+    tempPath = exclusiveSibling(file, `.foldview-tmp-${process.pid}-${nonce}`, mode, target, provider, 1);
+    if (typeof options.beforeFinalCheck === 'function') options.beforeFinalCheck(file);
+    const finalSnapshot = safeConfigRead(file, provider, true);
+    if (!configSnapshotEqual(locked, finalSnapshot)) throw aiError('config_changed', `${AI_PROVIDER_META[provider].name} configuration changed during the save.`, provider);
+    fs.renameSync(tempPath, file); tempPath = null; renamed = true;
+    fs.chmodSync(file, mode);
+    const installed = fs.statSync(file);
+    const uid = typeof process.geteuid === 'function' ? process.geteuid() : installed.uid;
+    if (installed.uid !== uid && typeof fs.chownSync === 'function') fs.chownSync(file, uid, installed.gid);
+    try {
+      const dirFd = fs.openSync(path.dirname(file), fs.constants.O_RDONLY);
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    } catch (err) {
+      if (!['EINVAL', 'ENOTSUP', 'EISDIR'].includes(err?.code)) throw err;
+    }
+    if (typeof options.afterRename === 'function') options.afterRename(file);
+    const defaults = readAIProviderDefaults(provider, options);
+    return { schemaVersion: 1, provider, defaultModel: defaults.defaultModel, defaultEffort: defaults.defaultEffort, saved: true };
+  } catch (err) {
+    if (renamed) throw aiError('config_write_failed', `${AI_PROVIDER_META[provider].name} configuration was installed but final verification failed.`, provider);
+    if (err instanceof AIProviderError) throw err;
+    throw aiError('config_write_failed', `${AI_PROVIDER_META[provider].name} configuration could not be saved safely.`, provider);
+  } finally {
+    if (tempPath) try { fs.unlinkSync(tempPath); } catch {}
+    releaseProviderLock(lock);
+  }
 }
 // validate + resolve a custom CLI text-prompt value. Never a shell expression: reject pipes,
 // redirects, separators, substitutions, and empty input. Bare names resolve via `command -v`;
@@ -305,17 +1192,25 @@ function buildAITerminalsScript(cmds, rects) {
 }
 // core launch: resolves + validates, spawns exactly one detached osascript, and resolves once the
 // child settles (error or exit). Never throws; never runs a different executable than requested.
-function spawnAITerminals(p, cliEntry, n) {
+function buildAITerminalCommand(projectPath, cliEntry, launchSpec = null) {
+  const invocation = launchSpec
+    ? buildAIProviderLaunch(launchSpec.provider, cliEntry.executable, launchSpec.model, launchSpec.effort)
+    : { env: [], argv: [cliEntry.executable] };
+  const tokens = invocation.env.map(quoteEnv).concat(invocation.argv.map(shq));
+  return `cd ${shq(projectPath)} && ${tokens.join(' ')}`;
+}
+function spawnAITerminals(p, cliEntry, n, launchSpec = null) {
   return new Promise(resolve => {
     if (PLATFORM !== 'darwin') { resolve({ ok: false, message: 'AI terminals: macOS only for now' }); return; }
-    if (!p || !p.path || !fs.existsSync(p.path) || !fs.statSync(p.path).isDirectory()) {
-      resolve({ ok: false, message: 'no local directory for this entry' }); return;
-    }
+    try { if (!p || !p.path || !fs.statSync(p.path).isDirectory()) throw new Error('missing'); }
+    catch { resolve({ ok: false, message: 'no local directory for this entry' }); return; }
     const exe = cliEntry && cliEntry.executable;
-    try { if (!exe) throw new Error('missing'); fs.accessSync(exe, fs.constants.X_OK); }
+    try { if (!executableFile(exe)) throw new Error('missing'); }
     catch { resolve({ ok: false, message: `AI terminals: could not resolve ${(cliEntry && cliEntry.name) || 'CLI'}` }); return; }
 
-    const cmd = `cd ${shq(p.path)} && ${shq(exe)}`;
+    let cmd;
+    try { cmd = buildAITerminalCommand(p.path, cliEntry, launchSpec); }
+    catch { resolve({ ok: false, message: 'AI terminals: invalid provider launch selection' }); return; }
     const cmds = Array.from({ length: n }, () => cmd);
     const rects = computeGrid(n, getMainDisplayBounds());
     const script = buildAITerminalsScript(cmds, rects);
@@ -329,7 +1224,8 @@ function spawnAITerminals(p, cliEntry, n) {
       if (settled) return; settled = true;
       resolve(code === 0 ? { ok: true, message: `opened ${n} × ${displayName}` } : { ok: false, message: 'could not open Terminal windows' });
     });
-    child.unref();
+    // Keep the short-lived Automation process referenced until its exit status is known. The
+    // machine-facing CLI must not terminate before it can emit its single success/failure JSON.
   });
 }
 
@@ -481,37 +1377,157 @@ function subFeaturesOf(project, pkg, st) {
 
 // ───────────────────────── app config (~/.foldview.json) ──────────────
 // schemaVersion 1 (frozen): { schemaVersion, roots, recentProjects, menubar:{refreshSeconds,
-// showDiscoveredApps}, apps, hidden, aiClis }. ensureConfigDefaults never drops unknown fields —
-// it only fills in what's missing, so every writer's read-merge-write preserves the rest.
-function ensureConfigDefaults(cfg) {
-  if (cfg.schemaVersion == null) cfg.schemaVersion = 1;
-  if (!Array.isArray(cfg.roots)) cfg.roots = [];
-  if (!Array.isArray(cfg.recentProjects)) cfg.recentProjects = [];
-  if (!cfg.menubar || typeof cfg.menubar !== 'object') cfg.menubar = {};
-  if (cfg.menubar.refreshSeconds == null) cfg.menubar.refreshSeconds = 60;
-  if (cfg.menubar.showDiscoveredApps == null) cfg.menubar.showDiscoveredApps = true;
-  if (!Array.isArray(cfg.apps)) cfg.apps = [];
-  if (!Array.isArray(cfg.hidden)) cfg.hidden = [];
-  if (!Array.isArray(cfg.aiClis)) cfg.aiClis = [];
-  return cfg;
+// showDiscoveredApps}, apps, hidden, aiClis }. Only these recognized fields cross the storage
+// boundary. Invalid types are rejected instead of being silently interpreted as defaults.
+const CONFIG_LOCK_PATH = CONFIG_PATH + '.lock';
+const CONFIG_KEYS = ['schemaVersion', 'roots', 'recentProjects', 'menubar', 'apps', 'hidden', 'aiClis'];
+function configError(message) { return new Error(`unsafe Foldview config: ${message}`); }
+function requireArray(value, name, fallback = []) {
+  if (value === undefined) return fallback;
+  if (!Array.isArray(value)) throw configError(`${name} must be an array`);
+  return value;
 }
-function readConfig() { return ensureConfigDefaults(readJSON(CONFIG_PATH) || {}); }
-// atomic write: tmp file + rename, so a reader never observes a partial/invalid file.
-function writeConfig(cfg) {
+function normalizeAbsolutePaths(value, name) {
+  return requireArray(value, name).map((item, index) => {
+    if (typeof item !== 'string' || !path.isAbsolute(item) || item.includes('\0'))
+      throw configError(`${name}[${index}] must be an absolute path`);
+    return path.normalize(item);
+  });
+}
+function normalizeApp(item, index) {
+  if (!item || typeof item !== 'object' || Array.isArray(item)) throw configError(`apps[${index}] must be an object`);
+  if (typeof item.name !== 'string' || !item.name.trim() || item.name.length > 120)
+    throw configError(`apps[${index}].name must be 1-120 characters`);
+  const out = { name: item.name };
+  if (item.desc !== undefined) {
+    if (typeof item.desc !== 'string' || item.desc.length > 500) throw configError(`apps[${index}].desc must be a string`);
+    out.desc = item.desc;
+  }
+  if (item.url !== undefined) {
+    if (typeof item.url !== 'string' || !/^https?:\/\/[^\s]+$/i.test(item.url)) throw configError(`apps[${index}].url is invalid`);
+    out.url = item.url;
+  }
+  if (item.port !== undefined) {
+    if (!Number.isInteger(item.port) || item.port < 1 || item.port > 65535) throw configError(`apps[${index}].port is invalid`);
+    out.port = item.port;
+  }
+  if (item.path !== undefined) {
+    if (typeof item.path !== 'string' || !path.isAbsolute(item.path)) throw configError(`apps[${index}].path must be absolute`);
+    out.path = path.normalize(item.path);
+  }
+  if (out.url === undefined && out.port === undefined) throw configError(`apps[${index}] requires url or port`);
+  return out;
+}
+function normalizeAICli(item, index) {
+  if (!item || typeof item !== 'object' || Array.isArray(item) || typeof item.name !== 'string' ||
+      !item.name.trim() || item.name.length > 80 || sanitizeAIText(item.name, 80) !== item.name)
+    throw configError(`aiClis[${index}].name is invalid`);
+  if (typeof item.executable !== 'string' || !path.isAbsolute(item.executable) || item.executable.includes('\0'))
+    throw configError(`aiClis[${index}].executable must be absolute`);
+  return { name: item.name, executable: path.normalize(item.executable) };
+}
+function ensureConfigDefaults(input = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw configError('top level must be an object');
+  const schemaVersion = input.schemaVersion === undefined ? 1 : input.schemaVersion;
+  if (schemaVersion !== 1) throw configError(`unsupported schemaVersion ${String(schemaVersion)}`);
+  const menubar = input.menubar === undefined ? {} : input.menubar;
+  if (!menubar || typeof menubar !== 'object' || Array.isArray(menubar)) throw configError('menubar must be an object');
+  const refreshSeconds = menubar.refreshSeconds === undefined ? 60 : menubar.refreshSeconds;
+  const showDiscoveredApps = menubar.showDiscoveredApps === undefined ? true : menubar.showDiscoveredApps;
+  if (!Number.isInteger(refreshSeconds) || refreshSeconds < 15 || refreshSeconds > 600)
+    throw configError('menubar.refreshSeconds must be an integer from 15 to 600');
+  if (typeof showDiscoveredApps !== 'boolean') throw configError('menubar.showDiscoveredApps must be boolean');
+  const hidden = requireArray(input.hidden, 'hidden').map((port, index) => {
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw configError(`hidden[${index}] is invalid`);
+    return port;
+  });
+  return {
+    schemaVersion: 1,
+    roots: normalizeAbsolutePaths(input.roots, 'roots'),
+    recentProjects: normalizeAbsolutePaths(input.recentProjects, 'recentProjects'),
+    menubar: { refreshSeconds, showDiscoveredApps },
+    apps: requireArray(input.apps, 'apps').map(normalizeApp),
+    hidden,
+    aiClis: requireArray(input.aiClis, 'aiClis').map(normalizeAICli),
+  };
+}
+function assertSecureConfigParent() {
+  const st = fs.lstatSync(HOME);
+  if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.geteuid() || (st.mode & 0o022) !== 0)
+    throw configError('home directory has unsafe ownership or permissions');
+}
+function assertSafeConfigFile(file = CONFIG_PATH, allowMissing = true) {
+  let st;
+  try { st = fs.lstatSync(file); }
+  catch (err) { if (allowMissing && err?.code === 'ENOENT') return null; throw err; }
+  if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.geteuid() || (st.mode & 0o077) !== 0)
+    throw configError(`${path.basename(file)} must be a current-user-owned 0600 regular file`);
+  return st;
+}
+function readConfig() {
+  assertSecureConfigParent();
+  if (!assertSafeConfigFile()) return ensureConfigDefaults({});
+  let parsed;
+  try { parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8')); }
+  catch { throw configError('file is corrupt JSON'); }
+  return ensureConfigDefaults(parsed);
+}
+function sleepSync(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
+}
+function acquireConfigLock(timeoutMs = 3000) {
+  assertSecureConfigParent();
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    assertSafeConfigFile(CONFIG_LOCK_PATH, true);
+    const oldUmask = process.umask(0o077);
+    try {
+      execFileSync('/usr/bin/shlock', ['-p', String(process.pid), '-f', CONFIG_LOCK_PATH], { stdio: 'ignore', timeout: 1000 });
+      assertSafeConfigFile(CONFIG_LOCK_PATH, false);
+      return () => {
+        try {
+          const owner = fs.readFileSync(CONFIG_LOCK_PATH, 'utf8').trim();
+          if (owner === String(process.pid)) fs.unlinkSync(CONFIG_LOCK_PATH);
+        } catch {}
+      };
+    } catch (err) {
+      if (Date.now() >= deadline) throw configError('timed out waiting for the config lock');
+    } finally { process.umask(oldUmask); }
+    sleepSync(25);
+  }
+}
+function writeConfigUnlocked(cfg) {
+  const normalized = ensureConfigDefaults(cfg);
+  assertSafeConfigFile();
+  let tmp = CONFIG_PATH + '.tmp-' + process.pid + '-' + crypto.randomBytes(12).toString('hex');
   try {
-    ensureConfigDefaults(cfg);
-    const tmp = CONFIG_PATH + '.tmp-' + process.pid + '-' + Date.now() + '-' + Math.random().toString(36).slice(2);
-    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2) + '\n');
+    const fd = fs.openSync(tmp, 'wx', 0o600);
+    try {
+      fs.writeFileSync(fd, JSON.stringify(normalized, null, 2) + '\n');
+      fs.fsyncSync(fd);
+    } finally { fs.closeSync(fd); }
     fs.renameSync(tmp, CONFIG_PATH);
+    tmp = null;
+    const parentFd = fs.openSync(HOME, fs.constants.O_RDONLY);
+    try { fs.fsyncSync(parentFd); } finally { fs.closeSync(parentFd); }
     return true;
-  } catch { return false; }
+  } finally { if (tmp) try { fs.unlinkSync(tmp); } catch {} }
 }
-// read-merge-write in one step: mutate a freshly-read config, then write it back atomically.
-// Callers should only touch the fields they own, so unrelated concurrent settings survive.
+function writeConfig(cfg) {
+  let release;
+  try { release = acquireConfigLock(); return writeConfigUnlocked(cfg); }
+  catch { return false; }
+  finally { release?.(); }
+}
 function updateConfig(mutator) {
-  const cfg = readConfig();
-  mutator(cfg);
-  return writeConfig(cfg);
+  let release;
+  try {
+    release = acquireConfigLock();
+    const cfg = readConfig();
+    mutator(cfg);
+    return writeConfigUnlocked(cfg);
+  } catch { return false; }
+  finally { release?.(); }
 }
 // detectors + user-configured apps, de-duplicated by port|url (detectors win).
 function loadExtraApps() {
@@ -526,24 +1542,23 @@ function loadExtraApps() {
   });
 }
 function addUserApp(app) {                       // persist a pinned app (idempotent by port|url)
-  const cfg = readConfig();
   const k = String(app.port || app.url);
-  cfg.apps = (Array.isArray(cfg.apps) ? cfg.apps : []).filter(a => String(a.port || a.url) !== k);
-  cfg.apps.push(app);
-  return writeConfig(cfg);
+  return updateConfig(cfg => {
+    cfg.apps = cfg.apps.filter(a => String(a.port || a.url) !== k);
+    cfg.apps.push(app);
+  });
 }
 function removeUserApp(app) {                    // drop a pinned app
-  const cfg = readConfig();
-  if (!Array.isArray(cfg.apps)) return false;
-  const k = String(app.port || app.url), before = cfg.apps.length;
-  cfg.apps = cfg.apps.filter(a => String(a.port || a.url) !== k);
-  return writeConfig(cfg) && cfg.apps.length < before;
+  const k = String(app.port || app.url); let removed = false;
+  const ok = updateConfig(cfg => {
+    const before = cfg.apps.length;
+    cfg.apps = cfg.apps.filter(a => String(a.port || a.url) !== k);
+    removed = cfg.apps.length < before;
+  });
+  return ok && removed;
 }
 function hideDiscovered(port) {                  // stop auto-surfacing this discovered port
-  const cfg = readConfig();
-  cfg.hidden = Array.isArray(cfg.hidden) ? cfg.hidden : [];
-  if (!cfg.hidden.includes(port)) cfg.hidden.push(port);
-  return writeConfig(cfg);
+  return updateConfig(cfg => { if (!cfg.hidden.includes(port)) cfg.hidden.push(port); });
 }
 
 // ────────────────── managed runtime registry (dev servers Foldview starts) ─────────────────
@@ -819,7 +1834,8 @@ const COMMON_PORTS = [3000, 3001, 3002, 3003, 4200, 4321, 5000, 5173, 5174, 8000
 // OS/background daemons that happen to bind common ports (e.g. macOS Control Center/AirPlay on :5000,
 // :7000) — never surfaced as "discovered apps", so a fresh install shows real apps, not system noise.
 const SYSTEM_PROCS = new Set(['ControlCenter', 'ControlCe', 'rapportd', 'sharingd', 'AirPlayXPCHelper',
-  'identityservicesd', 'remoted', 'launchd', 'mDNSResponder', 'rapport']);
+  'identityservicesd', 'remoted', 'launchd', 'mDNSResponder', 'rapport',
+  'AirPlayUIAgent', 'assistantd', 'bluetoothd', 'commerced', 'ContinuityCaptur', 'universalcontrol']);
 function checkPort(port) {
   return new Promise(res => {
     const s = net.connect({ host: '127.0.0.1', port }, () => { s.destroy(); res(true); });
@@ -837,7 +1853,60 @@ function portCwd(port) {
   const m = sh(`lsof -a -p ${pid} -d cwd -Fn 2>/dev/null`, 1500).match(/^n(.*)$/m);
   return m ? m[1] : '';
 }
+// parse `lsof -nP -iTCP -sTCP:LISTEN -F pcn` field output (p<pid> / c<comm> / n<addr:port> lines)
+// into one {port, pid, comm} per listening port. only loopback-reachable binds count (127.0.0.1,
+// ::1, and the v4/v6 wildcards); a server dual-bound v4+v6 folds to one entry per port (first pid
+// wins). pure — the shell-out lives in sweepPorts, so this parses canned transcripts in tests.
+function parseLsofListeners(text) {
+  const byPort = new Map();
+  let pid = 0, comm = '';
+  for (const line of String(text || '').split('\n')) {
+    const tag = line[0], rest = line.slice(1);
+    if (tag === 'p') { pid = Number(rest) || 0; comm = ''; }
+    else if (tag === 'c') comm = rest;
+    else if (tag === 'n') {
+      const m = rest.match(/^(?:\*|0\.0\.0\.0|127\.0\.0\.1|\[::\]|\[::1\]):(\d{1,5})$/);
+      if (!m) continue;                            // LAN-only bind (192.168.…) or junk — not reachable via localhost
+      const port = Number(m[1]);
+      if (port && !byPort.has(port)) byPort.set(port, { port, pid, comm });
+    }
+  }
+  return [...byPort.values()];
+}
+// comm name per live port, refreshed by every successful sweep — lets mergeDiscovered classify
+// system daemons without shelling out once per discovered port.
+const portCommCache = new Map();
+// enumerate EVERY listening TCP port in one lsof sweep (finds servers on any port — the old probe
+// list missed unlisted ports and ::1-only binds entirely), then resolve all owners with one
+// batched cwd lookup: 2 subprocesses per scan total, vs 2 per live port before.
+function sweepPorts() {
+  const listeners = parseLsofListeners(sh('lsof -nP -iTCP -sTCP:LISTEN -F pcn 2>/dev/null', 2500));
+  if (!listeners.length) return null;              // lsof missing/broken → caller falls back to the probe list
+  const cwdOf = new Map();                         // pid -> cwd, from one batched lookup for all owners
+  const pids = [...new Set(listeners.map(l => l.pid).filter(Boolean))];
+  if (pids.length) {
+    let pid = 0;
+    for (const line of sh(`lsof -a -p ${pids.join(',')} -d cwd -Fn 2>/dev/null`, 2500).split('\n')) {
+      if (line[0] === 'p') pid = Number(line.slice(1)) || 0;
+      else if (line[0] === 'n' && pid) cwdOf.set(pid, line.slice(1));
+    }
+  }
+  const live = new Map();                          // port -> owner cwd ('' if unknown) — shape consumers rely on
+  portCommCache.clear();
+  for (const l of listeners) {
+    live.set(l.port, cwdOf.get(l.pid) || '');
+    portCommCache.set(l.port, l.comm || '');
+  }
+  return live;
+}
 async function scanPorts() {
+  if (PLATFORM !== 'win32') {
+    const swept = sweepPorts();
+    if (swept) return swept;
+  }
+  // fallback (win32 / no lsof): probe the guess list like before — misses unlisted ports, but
+  // degrades to exactly the old behavior instead of going blind.
+  portCommCache.clear();                           // sweep data is stale here; portComm() re-resolves per port
   const live = new Map();                          // port -> owner cwd ('' if unknown)
   const appPorts = [...appIndex.values()].map(a => a.port).filter(Boolean);   // include known-app ports
   const ports = [...new Set([...COMMON_PORTS, ...appPorts])];
@@ -860,8 +1929,11 @@ function mergeDiscovered() {
   const projPaths = state.projects.filter(p => !p.app).map(p => p.path);
   for (const [port, owner] of state.livePorts) {
     if (known.has(port) || hidden.has(port)) continue;
+    // privileged ports are OS services (smb, kerberos, cups, …), never someone's dev server —
+    // project attribution still sees them; they're just not surfaced as discovered apps.
+    if (port < 1024) continue;
     if (projPaths.some(pp => pathInside(owner, pp))) continue;           // it's a scanned project's server → shown there
-    const comm = portComm(port);
+    const comm = portCommCache.has(port) ? portCommCache.get(port) : portComm(port);
     if (comm && SYSTEM_PROCS.has(comm)) continue;                        // OS/background daemon, not a real app
     const named = owner && path.resolve(owner) !== path.resolve(HOME) ? path.basename(owner) : '';
     const name  = named || comm || `localhost:${port}`;
@@ -891,15 +1963,21 @@ function liveServerFor(projPath) {
   if (app) return state.livePorts.has(app.port) ? app.port : null;
   const srv = state.servers.get(projPath);         // a server pm itself started for this project
   if (srv && srv.status === 'live') return srv.port;
+  // A port a known app owns (e.g. claude-mem on :37701) is that app's server — never credit it to a
+  // project just because the app's worker happens to run with a cwd inside the project's folder.
+  const appPorts = new Set([...appIndex.values()].map(a => a.port).filter(Boolean));
   for (const [port, owner] of state.livePorts)     // an external server whose cwd is this project
-    if (pathInside(owner, projPath)) return port;
+    if (!appPorts.has(port) && pathInside(owner, projPath)) return port;
   return null;
 }
 // the real port a dev server bound to, parsed from its own log output — handles frameworks that
 // auto-increment when the guessed port is taken (e.g. Next.js falling back 3000 → 3001).
 function readLogPort(logFile) {
   try {
-    const m = [...fs.readFileSync(logFile, 'utf8').matchAll(/(?:localhost|127\.0\.0\.1):(\d{2,5})/gi)];
+    // servers announce their address many ways: localhost:3000, 127.0.0.1:3000, 0.0.0.0:4321,
+    // [::]:8080, or a full http://<host>:port url — accept them all.
+    const re = /(?:https?:\/\/(?:\[[^\]\s]*\]|[^\s:/]+)|localhost|127\.0\.0\.1|0\.0\.0\.0|\[[0-9a-f:]*\]):(\d{2,5})/gi;
+    const m = [...fs.readFileSync(logFile, 'utf8').matchAll(re)];
     if (m.length) return parseInt(m[m.length - 1][1], 10);   // last reported = final bound port
   } catch {}
   return null;
@@ -912,7 +1990,7 @@ function printList(root, asJson) {
   const rows = projects.map(p => ({ name: p.name, path: p.path, ...computeStats(p) }));
   if (asJson) { console.log(JSON.stringify(rows, null, 2)); return; }
 
-  console.log('\n' + gradient('  foldview') + c(C.orange, ' 🚀') + c(C.dim, `  ${rows.length} projects · ${root}\n`));
+  console.log('\n' + wordmark('  foldview') + c(C.brand, ' 🚀') + c(C.dim, `  ${rows.length} projects · ${root}\n`));
   const head = `  ${'PROJECT'.padEnd(26)}${'LOC'.padStart(9)}${'SOURCE'.padStart(10)}${'NODE_MOD'.padStart(11)}${'TOTAL'.padStart(10)}  TOP LANG`;
   console.log(c(C.dim, head));
   console.log(c(C.border, '  ' + repeat('─', head.length)));
@@ -937,7 +2015,7 @@ function printList(root, asJson) {
 
 function printHelp() {
   console.log(`
-${gradient('foldview')}${c(C.orange, ' 🚀')} — ${c(C.dim, 'Your projects and AI coding tools, ready in one terminal.')}
+${wordmark('foldview')}${c(C.brand, ' 🚀')} — ${c(C.dim, 'Your projects and AI coding tools, ready in one terminal.')}
   A local-first terminal home for projects, local apps, and AI coding agents.
 
 ${c(C.dim, 'USAGE')}
@@ -964,21 +2042,31 @@ ${c(C.dim, 'ADVANCED (menu-bar bridge — for scripts and the optional companion
   pm status --format menubar-json                  fast JSON status, no LOC/disk/git walks
   pm roots list [--json] | add <dir> | remove <dir> manage scanned project roots
   pm action open|start|stop|editor --project <dir> [--open]
+  pm ai catalog [--provider <codex|kimi>] --json
+  pm ai defaults get --provider <codex|kimi> --json
+  pm ai defaults set --provider <codex|kimi> --model <id> [--effort <value>] --json
   pm action ai --project <dir> --cli <abs-executable> --count <1-9>
-  pm menubar [--force-install]                      install/launch the menu-bar companion
+               [--provider <codex|kimi>] [--model <id>] [--effort <value>] [--json]
+  pm config get --json | set menubar.<setting> <value>
+  pm aiclis add --name <name> --executable <path> | remove --executable <path>
+  pm menubar [--status|--force-install]             inspect or install/launch the companion
+  pm agents --json                                  live AI agents (claude/kimi/codex/claude-flow)
+  pm burn --json [--days N] [--refresh]             token usage, cost, coding time, GitHub commits
+  pm hooks install|uninstall|status                 manage notch-bridge hooks in CLI configs
+  pm hook-bridge <claude|kimi> <EventName>          stdin shim invoked by CLI hooks (fail-open)
 `);
 }
 
 // ════════════════════════════ TUI state ═══════════════════════════════
 const state = {
   mode: 'list',          // 'list' | 'help'
+  tab: 'launch',         // top-bar tab: 'launch' (↵ launches) | 'ai' (↵ opens AI swarm terminals)
   root: process.cwd(),
   projects: [],
   view: [],              // filtered project list
   sel: 0, scroll: 0,
   search: '', searching: false,
-  // AI-terminals prompt: null | { project, phase:'select-cli'|'custom-cli'|'select-count',
-  // choices, cli, input } — see discoverAIClis()/onKey()/footer().
+  // AI-terminals prompt: null | CLI/catalog/model/effort/count draft — see onKey()/footerAi().
   ai: null,
   adding: false, addBuf: '',   // "add app" text input (A) → persists to ~/.foldview.json
   cache: new Map(),      // path -> stats
@@ -1004,7 +2092,7 @@ function applyFilter() {
   state.view = q ? state.projects.filter(p => p.name.toLowerCase().includes(q)) : state.projects.slice();
   state.sel = Math.min(state.sel, Math.max(0, state.view.length - 1));
 }
-// list order: green ● live on top, then green ○ launchable-stopped, then red ● not-launchable;
+// list order: green ● live on top, then green ○ launchable-stopped, then orange ● not-launchable;
 // alphabetical (case-insensitive) within each group. re-runs whenever live state changes.
 // keeps the current project selected by path so the list doesn't jump under you.
 function sortProjects() {
@@ -1012,9 +2100,9 @@ function sortProjects() {
   const selPath = (state.view[state.sel] || {}).path;
   const rank = p => {
     const st = state.cache.get(p.path);
-    if (liveServerFor(p.path) != null)                 return 0;   // green ● — live (owned by this project)
-    if (st && (st.devName || st.port))                 return 1;   // green ○ — launchable, stopped
-    return 2;                                                      // red ● — not launchable
+    if (liveServerFor(p.path) != null)                 return 0;   // ● live (owned by this project)
+    if (st && (st.devName || st.port || st.siteDir))   return 1;   // ○ launchable, stopped (dev server or static site)
+    return 2;                                                      // ● not launchable
   };
   state.projects.sort((a, b) =>
     rank(a) - rank(b) || a.name.localeCompare(b.name, undefined, { sensitivity: 'base' }));
@@ -1061,10 +2149,18 @@ function bottom(L, Rr) { return c(C.border, '└' + repeat('─', L + 2) + '┴'
 function rowLine(left, right, L, Rr) {
   return c(C.border, '│') + ' ' + padTo(left, L) + ' ' + c(C.border, '│') + ' ' + padTo(right, Rr) + ' ' + c(C.border, '│');
 }
-function launchMenu(cols) {                     // the Launch menu — pinned to the top, always shown
-  const chip = bg(...C.selBg) + BOLD + rgb(...C.amber) + ' 🚦 Launch ' + R;
-  const left = '  ' + chip;
-  const hint = c(C.faint, '↵ launch — opens the site, starts the dev server if needed  ');
+function launchMenu(cols) {                     // the tab bar — pinned to the top, always shown
+  // two tabs: 🚦 Launch and 🤖 AI Swarm. The active one is highlighted; ⇥ switches between them,
+  // which changes what ↵ does on the selected project (launch its site vs. open AI terminals).
+  const activeChip  = (label) => bg(...C.selBg) + BOLD + rgb(...C.amber) + ` ${label} ` + R;
+  const idleChip    = (label) => c(C.faint, ` ${label} `);
+  const isAi = state.tab === 'ai';
+  const launchTab = isAi ? idleChip('🚦 Launch')   : activeChip('🚦 Launch');
+  const aiTab     = isAi ? activeChip('🤖 AI Swarm') : idleChip('🤖 AI Swarm');
+  const left = '  ' + launchTab + c(C.border, '│') + aiTab + c(C.faint, '  ⇥ switch');
+  const hint = c(C.faint, isAi
+    ? '↵ open AI terminals for this project  '
+    : '↵ launch — opens the site, starts the dev server if needed  ');
   return padTo(left, Math.max(0, cols - visLen(hint))) + hint;
 }
 
@@ -1092,8 +2188,8 @@ function render() {
   const here = inSub ? state.trail[state.trail.length - 1].path : state.root;
   const rootLabel = c(C.dim, trunc(here.replace(os.homedir(), '~'), 30));
   const brand = inSub
-    ? gradient('foldview') + state.trail.map(t => c(C.faint, ' › ') + c(C.amber, trunc(t.name, 18))).join('')
-    : `${gradient('foldview')}${c(C.orange, ' 🚀')}`;
+    ? wordmark('foldview') + state.trail.map(t => c(C.faint, ' › ') + c(C.amber, trunc(t.name, 18))).join('')
+    : `${wordmark('foldview')}${c(C.brand, ' 🚀')}`;
   const head = `  ${brand}  ${c(C.faint, '·')}  ${c(C.dim, count)}   ${rootLabel}`;
   const headRight = `${livePorts}  `;
   lines.push(padTo(head, cols - visLen(headRight)) + headRight);
@@ -1119,8 +2215,35 @@ function footerAi(a, cols) {
       keyhints([['↵', 'save'], ['esc', 'cancel']]);
   }
   if (a.phase === 'select-count') {
-    return ' ' + c(C.amber, `${a.cli.name} — how many windows?`) + '   ' +
-      keyhints([['1-9', 'count'], ['esc', 'cancel']]);
+    const picked = [a.cli.name, a.model?.label || a.model?.id, a.effort].filter(Boolean).join(' · ');
+    return fit(' ' + c(C.amber, `${picked} — how many windows?`) + '   ' +
+      keyhints([['1-9', 'count'], ['esc', 'back']]), cols);
+  }
+  if (a.phase === 'loading-catalog') {
+    return fit(' ' + c(C.amber, `Loading ${a.cli.name} models…`) + '   ' + keyhints([['esc', 'back']]), cols);
+  }
+  if (a.phase === 'validating-selection') {
+    const picked = [a.cli.name, a.model?.label || a.model?.id, a.effort].filter(Boolean).join(' · ');
+    return fit(' ' + c(C.amber, `Validating ${picked}…`) + '   ' + keyhints([['esc', 'back']]), cols);
+  }
+  if (a.phase === 'catalog-error') {
+    const prefix = a.stale ? 'Selection changed: ' : '';
+    return fit(' ' + c(C.notRun, trunc(prefix + (a.error || 'model catalog unavailable'), Math.max(12, cols - 30))) + '   ' +
+      keyhints([['r', 'retry'], ['esc', 'back']]), cols);
+  }
+  if (a.phase === 'select-model') {
+    const models = a.providerCatalog?.models || [];
+    const pos = Math.max(0, models.findIndex(model => model.id === a.model?.id));
+    const chosen = models[pos];
+    return fit(' ' + c(C.amber, `${a.cli.name} model ${pos + 1}/${models.length}: ${chosen?.label || chosen?.id || '—'}`) + '   ' +
+      keyhints([['←→', 'choose'], ['↵', 'next'], ['esc', 'back']]), cols);
+  }
+  if (a.phase === 'select-effort') {
+    const efforts = a.model?.efforts || [];
+    const pos = Math.max(0, efforts.indexOf(a.effort));
+    const fixed = efforts.length === 1;
+    return fit(' ' + c(C.amber, `${a.model?.label || a.model?.id} · effort ${a.effort || '—'}${fixed ? ' (fixed)' : ` ${pos + 1}/${efforts.length}`}`) + '   ' +
+      keyhints(fixed ? [['↵', 'next'], ['esc', 'back']] : [['←→', 'choose'], ['↵', 'next'], ['esc', 'back']]), cols);
   }
   const prefix = ' ' + c(C.amber, `AI terminals → ${trunc(a.project.name, 20)}`) + '   ';
   const budget = cols - 1 - visLen(prefix);
@@ -1167,7 +2290,8 @@ function footer(cols) {
       keyhints([['↵', 'save'], ['esc', 'cancel']]) + c(C.faint, '   e.g.  grafana @ 3001');
   }
   // greedily include hints in priority order until we run out of width — so it never wraps
-  const all = [['↑↓', 'move'], ['↵', 'launch'], ['→', 'enter'], ['←', 'back'], ['d', 'start'], ['x', 'stop'],
+  const launchOrOpen = state.tab === 'ai' ? 'AI swarm' : 'launch';
+  const all = [['↑↓', 'move'], ['↵', launchOrOpen], ['⇥', 'tab'], ['→', 'enter'], ['←', 'back'], ['d', 'start'], ['x', 'stop'],
                ['a', 'AI'], ['p', 'push'], ['A', 'add app'], ['/', 'find'], ['?', 'help'], ['q', 'quit'], ['o', 'open'], ['e', 'editor']];
   const parts = []; let used = 1;                  // leading space
   for (const [k, v] of all) {
@@ -1202,19 +2326,20 @@ function listPane(L, H) {
       const srv = state.servers.get(spath);
       if (srv && srv.status === 'starting') { rstr = `${srv.port} ${spin}`; rcol = C.amber; }
       else if (live) { rstr = `${livePort} ●`; rcol = C.green; }
-      else if (st && st.port) { rstr = `${st.port} ○`; rcol = C.faint; }
+      else if (st && (st.port || st.siteDir)) { rstr = `${st.port || STATIC_PORT_BASE} ○`; rcol = C.faint; }
       else { rstr = st ? '—' : (state.cache.has(p.path) ? '·' : spin); rcol = C.faint; }
     }
     rstr = rstr.padStart(rightW);
     const marker = hasFeatures(p) ? ' ›' : '';    // this project can be entered (has sub-features)
     const name = trunc(p.name, nameW - marker.length);
     const pad = repeat(' ', Math.max(0, nameW - visLen(name) - marker.length));
-    const launchable = !!(st && (st.devName || st.port || st.isFeature));
+    const launchable = !!(st && (st.devName || st.port || st.isFeature || st.siteDir));
     let dot, dotCol;
-    if (!st)             { dot = ' '; dotCol = C.faint; }     // stats not computed yet
-    else if (live)       { dot = '●'; dotCol = C.green; }     // launchable + running
-    else if (launchable) { dot = '○'; dotCol = C.green; }     // launchable, stopped
-    else                 { dot = '●'; dotCol = C.notRun; }    // not launchable → red
+    if (!st)                     { dot = ' '; dotCol = C.faint; }   // stats not computed yet
+    else if (live && launchable) { dot = '●'; dotCol = C.green; }   // live & foldview can (re)launch it
+    else if (live)               { dot = '●'; dotCol = C.caution; } // live but foldview can't launch → orange
+    else if (launchable)         { dot = '○'; dotCol = C.green; }   // launchable, stopped
+    else                         { dot = '●'; dotCol = C.caution; } // exists but not launchable → orange, not red
     if (sel) {
       out.push(rgb(...C.amber) + '▌' + bg(...C.selBg) + rgb(...dotCol) + dot + ' ' +
         BOLD + rgb(...C.amber) + name + rgb(...C.dim) + marker + pad + ' ' + rgb(...rcol) + rstr + R);
@@ -1343,7 +2468,7 @@ function detailPane(W, H) {
 function renderHelp() {
   out('\x1b[H\x1b[2J');
   const L = [
-    '', '  ' + gradient('foldview') + c(C.orange, ' 🚀') + c(C.dim, '  — a terminal home for projects, local apps, and AI coding agents'), '',
+    '', '  ' + wordmark('foldview') + c(C.brand, ' 🚀') + c(C.dim, '  — a terminal home for projects, local apps, and AI coding agents'), '',
     c(C.dim, '  🚦 LAUNCH') + c(C.faint, '   the menu is pinned to the top of the dashboard'),
     '   ' + c(C.amber, '↵') + c(C.faint, '   opens the project in the browser (starts the dev server in the background if needed)'), '',
     c(C.dim, '  NAVIGATION'),
@@ -1522,8 +2647,8 @@ async function runPush(project, plan) {
 
 // TUI entrypoint — fire-and-forget (never awaited, never crashes the TUI); updates the status
 // line once the single detached osascript settles. See spawnAITerminals for the actual launch.
-function launchAITerminals(p, cliEntry, n) {
-  spawnAITerminals(p, cliEntry, n)
+function launchAITerminals(p, cliEntry, n, launchSpec = null) {
+  spawnAITerminals(p, cliEntry, n, launchSpec)
     .then(r => { setStatus(r.message); render(); })
     .catch(() => { setStatus('could not open Terminal windows'); render(); });
 }
@@ -1647,7 +2772,7 @@ function runDev() {                             // foreground (quits pm, shows l
   const [cmd, cmdArgs, label] = st.siteDir
     ? [process.execPath, [SELF_FILE, 'serve', st.siteDir], `serve ${path.basename(st.siteDir)}/`]
     : ['npm', ['run', st.devName], `npm run ${st.devName}`];
-  console.log('\n' + gradient('foldview') + c(C.orange, ' 🚀') + c(C.dim, `  running `) + c(C.blue, label) +
+  console.log('\n' + wordmark('foldview') + c(C.brand, ' 🚀') + c(C.dim, `  running `) + c(C.blue, label) +
     c(C.dim, `  in `) + c(C.amber, p.name) + '\n');
   const child = spawn(cmd, cmdArgs, { cwd: p.path, stdio: 'inherit' });
   child.on('exit', code => process.exit(code || 0));
@@ -1752,11 +2877,104 @@ function move(delta) {
 // ↵ — descend if the selected project has sub-features, otherwise launch it.
 function activate() {
   const p = state.view[state.sel]; if (!p) return;
+  if (state.tab === 'ai') { openAiPrompt(); return; }   // AI Swarm tab: ↵ opens AI terminals
   if (!p.app && !p.isFeature) {
     const st = statsNow(p);
     if (st && st.features && st.features.length) { enterProject(p); return; }
   }
   launchSelected();
+}
+// open the AI-terminals prompt for the currently selected project (shared by the `a` key and by
+// ↵ while the AI Swarm tab is active). Apps/features resolve to their owning project directory.
+function openAiPrompt() {
+  const p = dirEntry(state.view[state.sel]);
+  if (p) state.ai = { project: p, phase: 'select-cli', choices: discoverAIClis(), cli: null, input: '',
+    providerCatalog: null, model: null, effort: null, error: null, loadToken: 0 };
+}
+function resetAIEffort(a, model) {
+  const efforts = model?.efforts || [];
+  if (!efforts.length) return null;
+  if (efforts.includes(a.effort)) return a.effort;
+  if (model.defaultEffort && efforts.includes(model.defaultEffort)) return model.defaultEffort;
+  return efforts[0];
+}
+function initialAIEffort(providerCatalog, model) {
+  const efforts = model?.efforts || [];
+  if (!efforts.length) return null;
+  if (providerCatalog?.defaultEffort && efforts.includes(providerCatalog.defaultEffort)) return providerCatalog.defaultEffort;
+  if (model.defaultEffort && efforts.includes(model.defaultEffort)) return model.defaultEffort;
+  return efforts[0];
+}
+function moveAIChoice(a, field, choices, delta) {
+  if (!choices.length) return;
+  const current = field === 'model' ? a.model?.id : a.effort;
+  let index = choices.findIndex(choice => (field === 'model' ? choice.id : choice) === current);
+  index = (Math.max(0, index) + delta + choices.length) % choices.length;
+  if (field === 'model') { a.model = choices[index]; a.effort = resetAIEffort(a, a.model); }
+  else a.effort = choices[index];
+}
+function backAIPhase(a) {
+  if (a.phase === 'select-cli') return 'cancel';
+  if (a.phase === 'custom-cli') { a.phase = 'select-cli'; return 'back'; }
+  if (a.phase === 'loading-catalog' || a.phase === 'catalog-error' || a.phase === 'select-model') {
+    a.loadToken++; a.phase = 'select-cli'; a.providerCatalog = null; a.model = null; a.effort = null; return 'back';
+  }
+  if (a.phase === 'validating-selection') { a.loadToken++; a.phase = 'select-count'; return 'back'; }
+  if (a.phase === 'select-effort') { a.phase = 'select-model'; return 'back'; }
+  if (a.phase === 'select-count') {
+    if (!a.cli?.provider) a.phase = 'select-cli';
+    else if ((a.model?.efforts || []).length) a.phase = 'select-effort';
+    else a.phase = 'select-model';
+    return 'back';
+  }
+  return 'back';
+}
+function beginAICatalogLoad(a) {
+  const provider = a.cli?.provider || null;
+  if (!provider) { a.phase = 'select-count'; return; }
+  const token = ++a.loadToken;
+  a.phase = 'loading-catalog'; a.error = null; a.stale = false;
+  buildAIProviderCatalog(provider).then(envelope => {
+    if (state.ai !== a || a.loadToken !== token) return;
+    const catalog = envelope.providers[0];
+    if (!catalog?.available || !catalog.models.length) {
+      a.phase = 'catalog-error'; a.error = catalog?.error?.message || `${a.cli.name} models are unavailable`;
+    } else {
+      a.providerCatalog = catalog;
+      a.model = catalog.models.find(model => model.id === catalog.defaultModel) || catalog.models[0];
+      a.effort = initialAIEffort(catalog, a.model);
+      a.phase = 'select-model';
+    }
+    render();
+  }).catch(err => {
+    if (state.ai !== a || a.loadToken !== token) return;
+    a.phase = 'catalog-error'; a.error = err instanceof AIProviderError ? err.message : 'model catalog unavailable'; render();
+  });
+}
+async function submitAILaunch(a, count, options = {}) {
+  const launch = options.launch || launchAITerminals;
+  if (!a.cli?.provider) {
+    if (state.ai === a) state.ai = null;
+    launch(a.project, a.cli, count, null);
+    return;
+  }
+  const token = ++a.loadToken;
+  a.phase = 'validating-selection'; a.error = null; a.stale = false;
+  try {
+    const prepared = await (options.prepare || prepareAIValidatedLaunch)(
+      a.cli.executable, a.cli.provider, a.model?.id || null, a.effort || null
+    );
+    if (state.ai !== a || a.loadToken !== token) return;
+    state.ai = null;
+    launch(a.project, a.cli, count, prepared.launchSpec);
+  } catch (err) {
+    if (state.ai !== a || a.loadToken !== token) return;
+    if (err instanceof AIProviderError && err.providerCatalog) a.providerCatalog = err.providerCatalog;
+    a.stale = err?.code === 'unsupported_model' || err?.code === 'unsupported_effort';
+    a.error = err instanceof AIProviderError ? err.message : 'The model selection could not be validated.';
+    a.phase = 'catalog-error';
+    if (options.render) options.render(); else render();
+  }
 }
 function onKey(str, key) {
   if (state.mode === 'help') { state.mode = 'list'; render(); return; }
@@ -1772,13 +2990,15 @@ function onKey(str, key) {
     render(); return;
   }
 
-  if (state.ai) {                              // AI-terminals prompt: select-cli → [custom-cli] → select-count
+  if (state.ai) {                              // AI-terminals prompt: CLI → catalog → model → effort → count
     const a = state.ai;
     if (key.ctrl && key.name === 'c') { cleanup(); process.exit(0); }        // Ctrl-C: existing quit behavior
-    else if (key.name === 'escape') { state.ai = null; }                     // escape works at every phase
+    else if (key.name === 'escape') {
+      if (backAIPhase(a) === 'cancel') state.ai = null;
+    }
     else if (a.phase === 'select-cli') {                                    // only shortcuts shown, '+', escape
       if (str === '+') { a.phase = 'custom-cli'; a.input = ''; }
-      else if (str) { const found = a.choices.find(ch => ch.key === str); if (found) { a.cli = found; a.phase = 'select-count'; } }
+      else if (str) { const found = a.choices.find(ch => ch.key === str); if (found) { a.cli = found; beginAICatalogLoad(a); } }
     } else if (a.phase === 'custom-cli') {                                  // printable text, backspace, return, escape
       const n = key.name;
       if (n === 'return') {
@@ -1789,16 +3009,26 @@ function onKey(str, key) {
           const choices = discoverAIClis();
           a.choices = choices;
           a.cli = choices.find(ch => ch.executable === result.executable) || { name: result.name, executable: result.executable, key: null };
-          a.phase = 'select-count';
+          beginAICatalogLoad(a);
         }
       }
       else if (n === 'backspace') a.input = a.input.slice(0, -1);
       else if (str && str.length === 1 && !key.ctrl && !key.meta && str >= ' ') a.input += str;
+    } else if (a.phase === 'loading-catalog' || a.phase === 'validating-selection') { /* wait for validation */ }
+    else if (a.phase === 'catalog-error') { if (str === 'r') beginAICatalogLoad(a); }
+    else if (a.phase === 'select-model') {
+      const models = a.providerCatalog?.models || [];
+      if (key.name === 'left' || key.name === 'up') moveAIChoice(a, 'model', models, -1);
+      else if (key.name === 'right' || key.name === 'down') moveAIChoice(a, 'model', models, 1);
+      else if (key.name === 'return' && a.model) a.phase = a.model.efforts.length ? 'select-effort' : 'select-count';
+    } else if (a.phase === 'select-effort') {
+      const efforts = a.model?.efforts || [];
+      if (efforts.length > 1 && (key.name === 'left' || key.name === 'up')) moveAIChoice(a, 'effort', efforts, -1);
+      else if (efforts.length > 1 && (key.name === 'right' || key.name === 'down')) moveAIChoice(a, 'effort', efforts, 1);
+      else if (key.name === 'return') a.phase = 'select-count';
     } else if (a.phase === 'select-count') {                                // only digits 1-9, escape
       if (str >= '1' && str <= '9') {
-        const cli = a.cli, project = a.project;
-        state.ai = null;
-        launchAITerminals(project, cli, Number(str));
+        void submitAILaunch(a, Number(str));
       }
     }
     render(); return;
@@ -1836,6 +3066,7 @@ function onKey(str, key) {
     case 'pageup': move(-8); break;
     case 'pagedown': move(8); break;
     case 'return': activate(); break;
+    case 'tab': state.tab = state.tab === 'ai' ? 'launch' : 'ai'; break;   // ⇥ switch top tab
     case 'right': descendSelected(); break;                        // → enter sub-features
     case 'left': if (!goBack()) return; break;                     // ← back up a level (root: no-op)
     case 'escape': if (goBack()) break; cleanup(); process.exit(0); break;
@@ -1853,11 +3084,7 @@ function onKey(str, key) {
         case 'x': { const p = state.view[state.sel]; if (p) removeOrStop(dirEntry(p)); break; }
         case 'o': openLocalhost(); break;
         case 'e': { const p = dirEntry(state.view[state.sel]); if (p) openEditor(p.path); break; }
-        case 'a': {
-          const p = dirEntry(state.view[state.sel]);
-          if (p) state.ai = { project: p, phase: 'select-cli', choices: discoverAIClis(), cli: null, input: '' };
-          break;
-        }
+        case 'a': openAiPrompt(); break;
         case 'p': { const p = dirEntry(state.view[state.sel]); if (p) openPushPrompt(p); break; }
         case 'A': state.adding = true; state.addBuf = ''; break;
         case 's': { const p = state.view[state.sel]; if (p) saveDiscovered(p); break; }
@@ -1931,6 +3158,71 @@ function parseFlagValue(argv, flag) {
   const i = argv.indexOf(flag);
   return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
 }
+function parseStrictFlags(argv, valueFlags, booleanFlags = new Set()) {
+  const values = {}, seen = new Set();
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i];
+    if (!valueFlags.has(flag) && !booleanFlags.has(flag))
+      throw aiError('invalid_arguments', `Unknown or misplaced argument: ${sanitizeAIText(String(flag), 80)}.`);
+    if (seen.has(flag)) throw aiError('invalid_arguments', `Argument ${flag} may be supplied only once.`);
+    seen.add(flag);
+    if (booleanFlags.has(flag)) { values[flag] = true; continue; }
+    if (i + 1 >= argv.length || argv[i + 1].startsWith('--'))
+      throw aiError('invalid_arguments', `Argument ${flag} requires a value.`);
+    values[flag] = argv[++i];
+  }
+  return values;
+}
+function emitAIJSONFailure(err) {
+  const safe = err instanceof AIProviderError ? err : aiError('invalid_arguments', 'The command could not be completed safely.');
+  console.log(JSON.stringify({ schemaVersion: 1, ok: false, error: safe.toJSON() }));
+  process.exitCode = 1;
+}
+function requireAIProvider(value) {
+  if (value !== 'codex' && value !== 'kimi')
+    throw aiError('unsupported_provider', `Provider ${sanitizeAIText(String(value || ''), 64)} is not supported.`);
+  return value;
+}
+async function cmdAI(rest) {
+  const wantsJSON = rest.includes('--json');
+  try {
+    const sub = rest[0];
+    if (sub === 'catalog') {
+      const flags = parseStrictFlags(rest.slice(1), new Set(['--provider']), new Set(['--json']));
+      if (!flags['--json']) throw aiError('invalid_arguments', 'pm ai catalog requires --json.');
+      const provider = flags['--provider'] === undefined ? null : requireAIProvider(flags['--provider']);
+      const envelope = await buildAIProviderCatalog(provider);
+      console.log(JSON.stringify(envelope));
+      if (!envelope.providers.some(item => item.available)) process.exitCode = 1;
+      return;
+    }
+    if (sub === 'defaults' && (rest[1] === 'get' || rest[1] === 'set')) {
+      const operation = rest[1];
+      const flags = parseStrictFlags(rest.slice(2), new Set(['--provider', '--model', '--effort']), new Set(['--json']));
+      if (!flags['--json']) throw aiError('invalid_arguments', `pm ai defaults ${operation} requires --json.`);
+      if (flags['--provider'] === undefined) throw aiError('invalid_arguments', `pm ai defaults ${operation} requires --provider.`);
+      const provider = requireAIProvider(flags['--provider']);
+      if (operation === 'get') {
+        if (flags['--model'] !== undefined || flags['--effort'] !== undefined)
+          throw aiError('invalid_arguments', 'pm ai defaults get does not accept model or effort values.');
+        const catalog = availableProviderCatalog(await buildAIProviderCatalog(provider), provider);
+        console.log(JSON.stringify({ schemaVersion: 1, provider,
+          defaultModel: catalog.defaultModel, defaultEffort: catalog.defaultEffort }));
+        return;
+      }
+      const model = flags['--model'];
+      if (model === undefined || !validAIID(model)) throw aiError('invalid_arguments', 'pm ai defaults set requires a valid --model value.', provider);
+      const effort = flags['--effort'];
+      if (effort !== undefined && !validAIEffort(effort)) throw aiError('invalid_arguments', 'pm ai defaults set received an invalid --effort value.', provider);
+      console.log(JSON.stringify(await writeAIProviderDefaults(provider, model, effort)));
+      return;
+    }
+    throw aiError('invalid_arguments', 'pm ai: expected catalog or defaults get/set.');
+  } catch (err) {
+    if (wantsJSON) emitAIJSONFailure(err);
+    else { console.error(err instanceof AIProviderError ? err.message : 'pm ai: command failed'); process.exitCode = 1; }
+  }
+}
 // cheap per-project probe for the fast status path: package.json + mtime only — no LOC/disk/git walk.
 function lightProjectInfo(dir) {
   const pkg = readJSON(path.join(dir, 'package.json'));
@@ -1951,7 +3243,7 @@ async function buildMenubarStatus() {
     if (!fs.existsSync(root)) continue;
     for (const p of scanProjects(root)) { if (!seen.has(p.path)) { seen.add(p.path); projects.push(p); } }
   }
-  const apps = loadExtraApps();
+  const apps = cfg.menubar.showDiscoveredApps ? loadExtraApps() : [];
   const registry = loadRuntimeRegistry();
 
   const candidatePorts = new Set();
@@ -2023,6 +3315,83 @@ function cmdRoots(rest) {
   console.error('pm roots: expected list, add, or remove');
   process.exitCode = 1;
 }
+function cmdConfig(rest) {
+  const sub = rest[0];
+  if (sub === 'get') {
+    if (rest.length !== 2 || rest[1] !== '--json') {
+      console.error('pm config get: expected --json'); process.exitCode = 1; return;
+    }
+    console.log(JSON.stringify(readConfig()));
+    return;
+  }
+  if (sub !== 'set' || rest.length !== 3) {
+    console.error('pm config: expected get --json or set <key> <value>'); process.exitCode = 1; return;
+  }
+  const key = rest[1], raw = rest[2];
+  let value;
+  if (key === 'menubar.refreshSeconds') {
+    if (!/^\d+$/.test(raw)) { console.error('pm config set: refreshSeconds must be an integer from 15 to 600'); process.exitCode = 1; return; }
+    value = Number(raw);
+    if (!Number.isSafeInteger(value) || value < 15 || value > 600) {
+      console.error('pm config set: refreshSeconds must be an integer from 15 to 600'); process.exitCode = 1; return;
+    }
+  } else if (key === 'menubar.showDiscoveredApps') {
+    if (raw !== 'true' && raw !== 'false') {
+      console.error('pm config set: showDiscoveredApps must be true or false'); process.exitCode = 1; return;
+    }
+    value = raw === 'true';
+  } else {
+    console.error(`pm config set: unsupported key: ${key}`); process.exitCode = 1; return;
+  }
+  const ok = updateConfig(cfg => { cfg.menubar[key.split('.')[1]] = value; });
+  if (!ok) { console.error('pm config set: could not write config'); process.exitCode = 1; return; }
+  console.log(`${key}=${String(value)}`);
+}
+function cmdAIClis(rest) {
+  const sub = rest[0];
+  if (sub === 'add') {
+    let flags;
+    try { flags = parseStrictFlags(rest.slice(1), new Set(['--name', '--executable'])); }
+    catch (err) { console.error(err.message); process.exitCode = 1; return; }
+    const name = String(flags['--name'] || '').trim();
+    if (!name || name.length > 80 || sanitizeAIText(name, 80) !== name) {
+      console.error('pm aiclis add: --name must be 1-80 printable characters'); process.exitCode = 1; return;
+    }
+    if (flags['--executable'] === undefined) {
+      console.error('pm aiclis add: --executable is required'); process.exitCode = 1; return;
+    }
+    const resolved = resolveCustomCli(flags['--executable']);
+    if (!resolved.ok) { console.error(`pm aiclis add: ${resolved.error}`); process.exitCode = 1; return; }
+    const ok = updateConfig(cfg => {
+      cfg.aiClis = cfg.aiClis.filter(item => item && item.executable !== resolved.executable);
+      cfg.aiClis.push({ name, executable: resolved.executable });
+    });
+    if (!ok) { console.error('pm aiclis add: could not write config'); process.exitCode = 1; return; }
+    console.log(`added AI CLI: ${name} — ${resolved.executable}`);
+    return;
+  }
+  if (sub === 'remove') {
+    let flags;
+    try { flags = parseStrictFlags(rest.slice(1), new Set(['--executable'])); }
+    catch (err) { console.error(err.message); process.exitCode = 1; return; }
+    const raw = String(flags['--executable'] || '').trim();
+    if (!raw || FORBIDDEN_CLI_CHARS.test(raw) || (raw.includes('/') && !path.isAbsolute(raw))) {
+      console.error('pm aiclis remove: --executable must be a plain executable name or absolute path'); process.exitCode = 1; return;
+    }
+    const executable = path.isAbsolute(raw) ? path.normalize(raw) : resolveExecutable(raw);
+    if (!executable) { console.error(`pm aiclis remove: executable was not found: ${raw}`); process.exitCode = 1; return; }
+    let removed = false;
+    const ok = updateConfig(cfg => {
+      const before = cfg.aiClis.length;
+      cfg.aiClis = cfg.aiClis.filter(item => item && item.executable !== executable);
+      removed = cfg.aiClis.length !== before;
+    });
+    if (!ok) { console.error('pm aiclis remove: could not write config'); process.exitCode = 1; return; }
+    console.log(removed ? `removed AI CLI: ${executable}` : `AI CLI was not configured: ${executable}`);
+    return;
+  }
+  console.error('pm aiclis: expected add or remove'); process.exitCode = 1;
+}
 async function actionOpen(proj) {
   const info = lightProjectInfo(proj.path);
   if (info.port && await checkPort(info.port)) { openUrl(`http://localhost:${info.port}`); console.log(`opened http://localhost:${info.port}`); return; }
@@ -2073,15 +3442,57 @@ function actionEditor(proj) {
   try { spawn(ed, [proj.path], { stdio: 'ignore', detached: true }).unref(); console.log(`opened in ${ed}`); }
   catch { console.error('pm action editor: could not launch editor'); process.exitCode = 1; }
 }
-async function actionAi(proj, cliPath, count) {
-  if (PLATFORM !== 'darwin') { console.error('AI terminals: macOS only for now'); process.exitCode = 1; return; }
-  try { fs.accessSync(cliPath, fs.constants.X_OK); }
-  catch { console.error(`pm action ai: could not resolve ${cliPath}`); process.exitCode = 1; return; }
-  const result = await spawnAITerminals(proj, { name: path.basename(cliPath), executable: cliPath }, count);
-  if (result.ok) console.log(result.message); else { console.error(result.message); process.exitCode = 1; }
+async function actionAi(proj, cliPath, count, options = {}) {
+  const { json = false, provider = null, model = null, effort = null,
+    spawnTerminals = spawnAITerminals, prepare = prepareAIValidatedLaunch } = options;
+  const fail = err => {
+    if (json) emitAIJSONFailure(err);
+    else { console.error(err.message); process.exitCode = 1; }
+  };
+  if (PLATFORM !== 'darwin') { fail(aiError('launch_failed', 'AI terminals are available on macOS only.', provider)); return; }
+  try { if (!executableFile(cliPath)) throw new Error('not executable'); }
+  catch { fail(aiError('provider_unavailable', `Foldview could not resolve ${path.basename(cliPath)}.`, provider)); return; }
+  let classified = null, launchSpec = null;
+  try {
+    if (provider || model !== null || effort !== null) {
+      const prepared = await prepare(cliPath, provider, model, effort);
+      classified = prepared.provider; launchSpec = prepared.launchSpec;
+    } else if (json) classified = classifyAIProvider(cliPath);
+  } catch (err) { fail(err); return; }
+  let result;
+  try { result = await spawnTerminals(proj, { name: path.basename(cliPath), executable: cliPath }, count, launchSpec); }
+  catch { fail(aiError('launch_failed', 'Terminal Automation could not complete the requested launch.', classified)); return; }
+  if (result.ok) {
+    if (json) console.log(JSON.stringify({ schemaVersion: 1, ok: true, launched: count,
+      provider: classified, model, effort }));
+    else console.log(result.message);
+  } else fail(aiError('launch_failed', result.message, classified));
+}
+async function cmdActionAI(rest) {
+  const wantsJSON = rest.includes('--json');
+  try {
+    const flags = parseStrictFlags(rest.slice(1), new Set(['--project', '--cli', '--count', '--provider', '--model', '--effort']), new Set(['--json']));
+    const projectArg = flags['--project'], cliPath = flags['--cli'];
+    const countRaw = flags['--count'], count = Number(countRaw);
+    if (!projectArg || !path.isAbsolute(projectArg)) throw aiError('invalid_arguments', 'pm action ai requires --project <absolute-directory>.');
+    try { if (!fs.statSync(projectArg).isDirectory()) throw new Error('not directory'); }
+    catch { throw aiError('invalid_arguments', 'pm action ai project is not a directory.'); }
+    if (!cliPath || !path.isAbsolute(cliPath)) throw aiError('invalid_arguments', 'pm action ai requires --cli <absolute-executable>.');
+    if (countRaw === undefined || !/^\d+$/.test(countRaw) || !Number.isInteger(count) || count < 1 || count > 9)
+      throw aiError('invalid_arguments', 'pm action ai --count must be an integer 1-9.');
+    const provider = flags['--provider'] === undefined ? null : requireAIProvider(flags['--provider']);
+    const model = flags['--model'] ?? null, effort = flags['--effort'] ?? null;
+    if (model !== null && !validAIID(model)) throw aiError('invalid_arguments', 'pm action ai received an invalid --model value.', provider);
+    if (effort !== null && !validAIEffort(effort)) throw aiError('invalid_arguments', 'pm action ai received an invalid --effort value.', provider);
+    return await actionAi(makeProject(projectArg), cliPath, count, { json: !!flags['--json'], provider, model, effort });
+  } catch (err) {
+    if (wantsJSON) emitAIJSONFailure(err);
+    else { console.error(err instanceof AIProviderError ? err.message : 'pm action ai: command failed'); process.exitCode = 1; }
+  }
 }
 async function cmdAction(rest) {
   const sub = rest[0];
+  if (sub === 'ai') return cmdActionAI(rest);
   const projectArg = parseFlagValue(rest, '--project');
   if (!projectArg) { console.error('pm action: --project <absolute-directory> is required'); process.exitCode = 1; return; }
   const abs = path.resolve(projectArg);
@@ -2092,22 +3503,96 @@ async function cmdAction(rest) {
     case 'start': return actionStart(proj, rest.includes('--open'));
     case 'stop': return actionStop(proj);
     case 'editor': return actionEditor(proj);
-    case 'ai': {
-      const cliPath = parseFlagValue(rest, '--cli');
-      const count = Number(parseFlagValue(rest, '--count'));
-      if (!cliPath || !path.isAbsolute(cliPath)) { console.error('pm action ai: --cli <absolute-executable> is required'); process.exitCode = 1; return; }
-      if (!Number.isInteger(count) || count < 1 || count > 9) { console.error('pm action ai: --count must be an integer 1-9'); process.exitCode = 1; return; }
-      return actionAi(proj, cliPath, count);
-    }
     default: console.error('pm action: expected open, start, stop, editor, or ai'); process.exitCode = 1;
   }
 }
+const MENUBAR_APP_PATH = path.join(HOME, 'Applications', 'Foldview.app');
+const CLI_PATH_RECORD = path.join(HOME, 'Library', 'Application Support', 'Foldview', 'cli-path-v1');
+function packageVersion() {
+  try { return String(JSON.parse(fs.readFileSync(path.join(SELF_DIR, 'package.json'), 'utf8')).version || ''); }
+  catch { return ''; }
+}
+function plistValue(plist, key) {
+  return execFileSync('/usr/bin/plutil', ['-extract', key, 'raw', '-o', '-', plist],
+    { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+}
+function inspectMenubarInstallation(appPath = MENUBAR_APP_PATH) {
+  const plist = path.join(appPath, 'Contents', 'Info.plist');
+  const executable = path.join(appPath, 'Contents', 'MacOS', 'FoldviewMenuBar');
+  try {
+    const appStat = fs.lstatSync(appPath), plistStat = fs.lstatSync(plist), executableStat = fs.lstatSync(executable);
+    if (!appStat.isDirectory() || appStat.isSymbolicLink() || !plistStat.isFile() || plistStat.isSymbolicLink() ||
+        !executableStat.isFile() || executableStat.isSymbolicLink()) throw new Error('unsafe bundle shape');
+    const bundleID = plistValue(plist, 'CFBundleIdentifier');
+    const executableName = plistValue(plist, 'CFBundleExecutable');
+    const version = plistValue(plist, 'CFBundleShortVersionString');
+    if (bundleID !== 'com.foldview.menubar' || executableName !== 'FoldviewMenuBar' || !version)
+      throw new Error('unexpected bundle identity');
+    fs.accessSync(executable, fs.constants.X_OK);
+    execFileSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', appPath],
+      { stdio: 'ignore', timeout: 5000 });
+    const detail = spawnSync('/usr/bin/codesign', ['-dv', '--verbose=4', appPath],
+      { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (detail.status !== 0 || !/Signature=adhoc(?:\s|$)/.test(detail.stderr || ''))
+      throw new Error('bundle is not ad-hoc signed');
+    return { installed: true, version, executable };
+  } catch { return { installed: false, version: null, executable }; }
+}
+function installedMenubarVersion(appPath = MENUBAR_APP_PATH) {
+  return inspectMenubarInstallation(appPath).version;
+}
+function menubarIsRunning(appPath = MENUBAR_APP_PATH, processList = null) {
+  const executable = path.join(appPath, 'Contents', 'MacOS', 'FoldviewMenuBar');
+  try {
+    const output = processList ?? execFileSync('/bin/ps', ['-axo', 'command='],
+      { encoding: 'utf8', timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return String(output).split('\n').some(line => {
+      const command = line.trimStart();
+      return command === executable || command.startsWith(executable + ' ');
+    });
+  } catch { return false; }
+}
+function writeCLIPathRecord() {
+  const dir = path.dirname(CLI_PATH_RECORD);
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const temp = path.join(dir, `.cli-path-v1.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`);
+  try {
+    fs.writeFileSync(temp, SELF_FILE + '\n', { mode: 0o600, flag: 'wx' });
+    fs.renameSync(temp, CLI_PATH_RECORD);
+    fs.chmodSync(CLI_PATH_RECORD, 0o600);
+  } finally { try { fs.unlinkSync(temp); } catch {} }
+}
 function cmdMenubar(rest) {
+  const allowed = new Set(['--force-install', '--status']);
+  if (rest.some(flag => !allowed.has(flag)) || new Set(rest).size !== rest.length ||
+      (rest.includes('--force-install') && rest.includes('--status'))) {
+    console.error('pm menubar: expected --status or --force-install'); process.exitCode = 1; return;
+  }
+  if (PLATFORM !== 'darwin') { console.error('pm menubar: the native companion requires macOS'); process.exitCode = 1; return; }
+  const inspection = inspectMenubarInstallation();
+  const installedVersion = inspection.version;
+  const currentVersion = packageVersion();
+  if (rest.includes('--status')) {
+    console.log(JSON.stringify({ installed: inspection.installed, running: menubarIsRunning(),
+      current: inspection.installed && installedVersion === currentVersion,
+      version: installedVersion, expectedVersion: currentVersion, appPath: MENUBAR_APP_PATH,
+      cliPathRecord: CLI_PATH_RECORD }));
+    return;
+  }
   const force = rest.includes('--force-install');
-  console.log('pm menubar: the Foldview menu-bar companion is not installed yet.');
-  console.log(force
-    ? 'would install/launch FoldviewMenuBar.app in ~/Applications and record the CLI path.'
-    : 'run `pm menubar --force-install` to simulate installing it, or build mac/ (Swift companion) to add it for real.');
+  if (force || !inspection.installed || installedVersion !== currentVersion) {
+    const packager = path.join(SELF_DIR, 'mac', 'Packaging', 'package-app.sh');
+    if (!fs.existsSync(packager)) { console.error(`pm menubar: missing packager: ${packager}`); process.exitCode = 1; return; }
+    try { execFileSync(packager, [], { cwd: path.join(SELF_DIR, 'mac'), stdio: 'inherit', timeout: 10 * 60 * 1000 }); }
+    catch { console.error('pm menubar: package/install failed'); process.exitCode = 1; return; }
+  }
+  try {
+    writeCLIPathRecord();
+    execFileSync('/usr/bin/open', [MENUBAR_APP_PATH], { stdio: 'ignore', timeout: 15000 });
+    console.log(`Foldview is installed and launched: ${MENUBAR_APP_PATH}`);
+  } catch (err) {
+    console.error(`pm menubar: could not record or launch Foldview: ${err?.message || err}`); process.exitCode = 1;
+  }
 }
 // ───────────────── static site server (`pm serve <dir> [port]`) ─────────────────
 // A zero-dependency file server so a project that is just static HTML (no dev server) still
@@ -2168,18 +3653,1124 @@ function cmdServe(rest) {
   return startStaticServer(dir, startPort);
 }
 
-const SUBCOMMANDS = new Set(['status', 'roots', 'action', 'menubar', 'serve']);
+// ─────────────── telemetry subcommands: agents / burn / hooks ───────────────
+// Machine-readable JSON subcommands for the menu-bar companion: live agent discovery
+// (`pm agents --json`), token usage + spend report (`pm burn --json`), the stdin hook
+// shim the CLI hooks call (`pm hook-bridge`), and hook config management
+// (`pm hooks install|uninstall|status`). Everything here degrades gracefully: missing
+// dirs or files mean empty sections, never a throw.
+
+const AGENT_RECENCY_MS = 30 * 60_000;   // a transcript counts as "live" if touched < 30 min ago
+const AGENT_ACTIVE_MS = 2 * 60_000;     // ...and "active" if its last event is < 2 min old
+
+// read only the TAIL of a (potentially 100+ MB) JSONL transcript: the last `maxLines`
+// lines out of at most the last `maxBytes` bytes. Sync on purpose — one bounded chunk.
+function readFileTailLines(filePath, maxLines = 200, maxBytes = 256 * 1024) {
+  let fd;
+  try {
+    fd = fs.openSync(filePath, 'r');
+    const size = fs.fstatSync(fd).size;
+    const start = Math.max(0, size - maxBytes);
+    const buf = Buffer.alloc(size - start);
+    fs.readSync(fd, buf, 0, buf.length, start);
+    let text = buf.toString('utf8');
+    if (start > 0) {
+      const nl = text.indexOf('\n');
+      text = nl >= 0 ? text.slice(nl + 1) : '';   // drop the partial first line
+    }
+    return text.split('\n').filter(l => l.trim()).slice(-maxLines);
+  } catch { return []; }
+  finally { if (fd !== undefined) try { fs.closeSync(fd); } catch {} }
+}
+
+// parse the tail of a Claude Code transcript: session id, project cwd, and the action
+// implied by the LAST record (tool_use → "Using X", assistant text → "Writing",
+// user → "Waiting for model", anything else → null).
+function parseTranscriptTail(lines) {
+  let sessionId = null, cwd = null, startedAt = null, lastTimestamp = null, currentAction = null;
+  for (const line of lines) {
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!rec || typeof rec !== 'object') continue;
+    if (typeof rec.sessionId === 'string' && rec.sessionId) sessionId = rec.sessionId;
+    if (typeof rec.cwd === 'string' && rec.cwd) cwd = rec.cwd;
+    if (typeof rec.timestamp === 'string' && rec.timestamp) {
+      if (!startedAt) startedAt = rec.timestamp;
+      lastTimestamp = rec.timestamp;
+    }
+    if (rec.type === 'assistant') {
+      const content = Array.isArray(rec.message?.content) ? rec.message.content : [];
+      const tool = content.find(c => c && c.type === 'tool_use' && typeof c.name === 'string' && c.name);
+      currentAction = tool ? `Using ${tool.name}` : 'Writing';
+    } else if (rec.type === 'user') currentAction = 'Waiting for model';
+    else currentAction = null;
+  }
+  return { sessionId, cwd, startedAt, lastTimestamp, currentAction };
+}
+
+// Claude Code live agents: newest transcript per project slug, kept only if recently touched.
+function collectClaudeAgents(projectsDir, now = new Date()) {
+  const agents = [];
+  let slugs;
+  try { slugs = fs.readdirSync(projectsDir, { withFileTypes: true }); } catch { return agents; }
+  for (const d of slugs) {
+    if (!d.isDirectory()) continue;
+    const dir = path.join(projectsDir, d.name);
+    let files;
+    try { files = fs.readdirSync(dir).filter(f => f.endsWith('.jsonl')); } catch { continue; }
+    let newest = null, newestM = 0;
+    for (const f of files) {
+      let st;
+      try { st = fs.statSync(path.join(dir, f)); } catch { continue; }
+      if (st.mtimeMs > newestM) { newestM = st.mtimeMs; newest = f; }
+    }
+    if (!newest || now.getTime() - newestM > AGENT_RECENCY_MS) continue;
+    const info = parseTranscriptTail(readFileTailLines(path.join(dir, newest)));
+    const sessionId = info.sessionId || newest.replace(/\.jsonl$/, '');
+    const lastActivityAt = info.lastTimestamp || new Date(newestM).toISOString();
+    const lastMs = Date.parse(lastActivityAt);
+    agents.push({
+      id: `claude:${sessionId}`, _session: `claude:${sessionId}`, cli: 'claude', roles: ['interactive'],
+      project: info.cwd, pid: null,
+      status: !Number.isNaN(lastMs) && now.getTime() - lastMs < AGENT_ACTIVE_MS ? 'active' : 'idle',
+      currentAction: info.currentAction, startedAt: info.startedAt, lastActivityAt,
+    });
+  }
+  return agents;
+}
+
+// Kimi Code wire.jsonl tail: turn.prompt → "Waiting for model"; context.append_loop_event
+// keeps the last step/tool name; permission.record_approval_result → "Approval approved|denied".
+function parseKimiWireTail(lines) {
+  let currentAction = null, firstTime = null, lastTime = null;
+  for (const line of lines) {
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!rec || typeof rec !== 'object') continue;
+    const t = typeof rec.time === 'number' && Number.isFinite(rec.time) ? rec.time : NaN;
+    if (!Number.isNaN(t)) { if (firstTime === null) firstTime = t; lastTime = t; }
+    if (rec.type === 'turn.prompt') currentAction = 'Waiting for model';
+    else if (rec.type === 'context.append_loop_event') {
+      const ev = rec.event && typeof rec.event === 'object' ? rec.event
+        : (rec.payload && typeof rec.payload === 'object' ? rec.payload : {});
+      const name = [ev.name, ev.tool, ev.toolName, rec.name, rec.tool]
+        .find(v => typeof v === 'string' && v);
+      currentAction = name ? `Using ${name}` : 'Working';
+    } else if (rec.type === 'permission.record_approval_result') {
+      const approved = rec.approved === true || rec.result === 'approved' || rec.decision === 'approved';
+      currentAction = `Approval ${approved ? 'approved' : 'denied'}`;
+    }
+  }
+  return { currentAction, firstTime, lastTime };
+}
+
+// Kimi Code live agents from the session index + per-session wire tails.
+function collectKimiAgents(homeDir, now = new Date()) {
+  const agents = [];
+  let lines;
+  try {
+    lines = fs.readFileSync(path.join(homeDir, '.kimi-code', 'session_index.jsonl'), 'utf8')
+      .split('\n').filter(l => l.trim());
+  } catch { return agents; }
+  for (const line of lines) {
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    const sessionDir = rec?.sessionDir, sessionId = rec?.sessionId;
+    if (typeof sessionDir !== 'string' || !sessionDir || typeof sessionId !== 'string' || !sessionId) continue;
+    let refMs = null;                       // recency: state.json updatedAt, else dir mtime
+    const st = readJSON(path.join(sessionDir, 'state.json'));
+    if (st && typeof st.updatedAt === 'string') {
+      const t = Date.parse(st.updatedAt);
+      if (!Number.isNaN(t)) refMs = t;
+    }
+    if (refMs === null) { try { refMs = fs.statSync(sessionDir).mtimeMs; } catch { continue; } }
+    if (now.getTime() - refMs > AGENT_RECENCY_MS) continue;
+    let wirePath = null, wireM = 0;         // newest agents/*/wire.jsonl under the session dir
+    try {
+      for (const a of fs.readdirSync(path.join(sessionDir, 'agents'), { withFileTypes: true })) {
+        if (!a.isDirectory()) continue;
+        const p = path.join(sessionDir, 'agents', a.name, 'wire.jsonl');
+        try {
+          const s = fs.statSync(p);
+          if (s.mtimeMs > wireM) { wireM = s.mtimeMs; wirePath = p; }
+        } catch {}
+      }
+    } catch {}
+    let currentAction = null, startedAt = null, lastMs = refMs;
+    if (wirePath) {
+      const info = parseKimiWireTail(readFileTailLines(wirePath));
+      currentAction = info.currentAction;
+      if (info.lastTime !== null) lastMs = info.lastTime;
+      if (info.firstTime !== null) startedAt = new Date(info.firstTime).toISOString();
+    }
+    agents.push({
+      id: `kimi:${sessionId}`, _session: `kimi:${sessionId}`, cli: 'kimi', roles: ['interactive'],
+      project: typeof rec.workDir === 'string' && rec.workDir ? rec.workDir : null, pid: null,
+      status: now.getTime() - lastMs < AGENT_ACTIVE_MS ? 'active' : 'idle',
+      currentAction, startedAt, lastActivityAt: new Date(lastMs).toISOString(),
+    });
+  }
+  return agents;
+}
+
+// Codex rollout tail: project from session_meta cwd; last event_msg decides the action
+// (task_started → "Working", task_complete → "Idle"; token_count leaves it untouched).
+function parseCodexRolloutTail(lines) {
+  let cwd = null, currentAction = null, startedAt = null, lastTimestamp = null;
+  for (const line of lines) {
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    if (!rec || typeof rec !== 'object') continue;
+    if (typeof rec.timestamp === 'string' && rec.timestamp) {
+      if (!startedAt) startedAt = rec.timestamp;
+      lastTimestamp = rec.timestamp;
+    }
+    if (rec.type === 'session_meta') {
+      const c = rec.payload && typeof rec.payload === 'object' ? rec.payload.cwd : rec.cwd;
+      if (typeof c === 'string' && c) cwd = c;
+    } else if (rec.type === 'event_msg') {
+      const pt = rec.payload && typeof rec.payload === 'object' ? rec.payload.type : null;
+      if (pt === 'task_started') currentAction = 'Working';
+      else if (pt === 'task_complete') currentAction = 'Idle';
+    }
+  }
+  return { cwd, currentAction, startedAt, lastTimestamp };
+}
+
+// every ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl, optionally only those naming `id`.
+function* walkCodexRollouts(homeDir, id = null) {
+  const root = path.join(homeDir, '.codex', 'sessions');
+  let years;
+  try { years = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+  for (const y of years) {
+    if (!y.isDirectory()) continue;
+    let months;
+    try { months = fs.readdirSync(path.join(root, y.name), { withFileTypes: true }); } catch { continue; }
+    for (const m of months) {
+      if (!m.isDirectory()) continue;
+      let days;
+      try { days = fs.readdirSync(path.join(root, y.name, m.name), { withFileTypes: true }); } catch { continue; }
+      for (const d of days) {
+        if (!d.isDirectory()) continue;
+        let files;
+        try { files = fs.readdirSync(path.join(root, y.name, m.name, d.name)); } catch { continue; }
+        for (const f of files) {
+          if (!f.startsWith('rollout-') || !f.endsWith('.jsonl')) continue;
+          if (id && !f.includes(id)) continue;
+          yield path.join(root, y.name, m.name, d.name, f);
+        }
+      }
+    }
+  }
+}
+
+// Codex live agents: index entries touched recently, matched to their newest rollout file.
+function collectCodexAgents(homeDir, now = new Date()) {
+  const agents = [];
+  let lines;
+  try {
+    lines = fs.readFileSync(path.join(homeDir, '.codex', 'session_index.jsonl'), 'utf8')
+      .split('\n').filter(l => l.trim());
+  } catch { return agents; }
+  for (const line of lines) {
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    const id = rec?.id;
+    if (typeof id !== 'string' || !id) continue;
+    const upMs = typeof rec.updated_at === 'string' ? Date.parse(rec.updated_at) : NaN;
+    if (Number.isNaN(upMs) || now.getTime() - upMs > AGENT_RECENCY_MS) continue;
+    let rollout = null, rolloutM = 0;       // newest rollout file for this session, if also recent
+    for (const p of walkCodexRollouts(homeDir, id)) {
+      try {
+        const st = fs.statSync(p);
+        if (now.getTime() - st.mtimeMs <= AGENT_RECENCY_MS && st.mtimeMs > rolloutM) { rolloutM = st.mtimeMs; rollout = p; }
+      } catch {}
+    }
+    if (!rollout) continue;
+    const info = parseCodexRolloutTail(readFileTailLines(rollout));
+    const lastActivityAt = info.lastTimestamp || new Date(rolloutM).toISOString();
+    const lastMs = Date.parse(lastActivityAt);
+    agents.push({
+      id: `codex:${id}`, _session: `codex:${id}`, cli: 'codex', roles: ['interactive'],
+      project: info.cwd, pid: null,
+      status: !Number.isNaN(lastMs) && now.getTime() - lastMs < AGENT_ACTIVE_MS ? 'active' : 'idle',
+      currentAction: info.currentAction, startedAt: info.startedAt, lastActivityAt,
+    });
+  }
+  return agents;
+}
+
+// one `ps -axo pid=,comm=,args=` snapshot shared by pid attribution + daemon detection.
+function parsePsTable(text) {
+  const rows = [];
+  for (const line of String(text || '').split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\S+)\s*(.*)$/);
+    if (m) rows.push({ pid: Number(m[1]), comm: m[2], args: (m[3] || '').trim() });
+  }
+  return rows;
+}
+function snapshotProcesses() {
+  return new Promise(resolve => {
+    try {
+      execFile('ps', ['-axo', 'pid=,comm=,args='], { timeout: 5000, maxBuffer: 16 * 1024 * 1024 },
+        (err, stdout) => resolve(err ? [] : parsePsTable(stdout)));
+    } catch { resolve([]); }
+  });
+}
+function isObserverRow(row) {
+  return row.args.includes('--output-format') && row.args.includes('stream-json');
+}
+
+// claude-flow daemons: the shared daemon-state.json (+ sibling daemon.pid), plus any
+// per-workspace daemons and stream-json observers visible in the ps snapshot.
+function collectClaudeFlowAgents(homeDir, psRows, now = new Date()) {
+  const agents = [];
+  const nowISO = now.toISOString();
+  const stateDir = path.join(homeDir, '.claude-flow');
+  const st = readJSON(path.join(stateDir, 'daemon-state.json'));
+  if (st && st.running === true) {
+    let pid = null;
+    try {
+      const n = Number(fs.readFileSync(path.join(stateDir, 'daemon.pid'), 'utf8').trim());
+      if (Number.isInteger(n) && n > 0) pid = n;
+    } catch {}
+    const project = typeof st.workspace === 'string' && st.workspace ? st.workspace
+      : (typeof st.cwd === 'string' && st.cwd ? st.cwd : null);
+    agents.push({
+      id: `claude-flow:daemon:${pid ?? 'state'}`, _session: null, cli: 'claude-flow', roles: ['daemon'],
+      project, pid, status: 'active', currentAction: null,
+      startedAt: typeof st.launchedAt === 'string' ? st.launchedAt : null, lastActivityAt: nowISO,
+    });
+  }
+  for (const row of psRows) {
+    if (row.args.includes('@claude-flow/cli') && /(^|\s)daemon(\s|$)/.test(row.args)) {
+      const m = row.args.match(/--workspace(?:=|\s+)(\S+)/);
+      agents.push({
+        id: `claude-flow:daemon:pid-${row.pid}`, _session: null, cli: 'claude-flow', roles: ['daemon'],
+        project: m ? m[1] : null, pid: row.pid, status: 'active', currentAction: null,
+        startedAt: null, lastActivityAt: nowISO,
+      });
+    } else if (isObserverRow(row)) {
+      agents.push({
+        id: `claude:observer:pid-${row.pid}`, _session: null, cli: 'claude', roles: ['observer'],
+        project: null, pid: row.pid, status: 'active', currentAction: null,
+        startedAt: null, lastActivityAt: nowISO,
+      });
+    }
+  }
+  return agents;
+}
+
+// mark pids on interactive agents by exact executable-basename match — only when the
+// mapping is unambiguous (exactly one live process for exactly one agent of that cli).
+function assignInteractivePids(agents, psRows) {
+  const pool = psRows.filter(r => !isObserverRow(r));   // stream-json observers are their own entries
+  for (const cli of ['claude', 'kimi', 'codex']) {
+    const pids = [...new Set(pool.filter(r => path.basename(r.comm) === cli).map(r => r.pid))];
+    const targets = agents.filter(a => a.cli === cli && a.roles.includes('interactive') && a.pid === null);
+    if (pids.length === 1 && targets.length === 1) targets[0].pid = pids[0];
+  }
+}
+
+// one logical agent seen from several sources (same session id, or same pid) becomes one
+// entry with the union of roles; null fields are filled from the other sightings.
+function mergeAgentEntries(entries) {
+  const merged = [];
+  for (const e of entries) {
+    const dup = merged.find(o =>
+      (e._session && o._session === e._session) ||
+      (e.pid !== null && o.pid === e.pid));
+    if (!dup) { merged.push(e); continue; }
+    dup.roles = [...new Set([...dup.roles, ...e.roles])];
+    for (const k of ['project', 'currentAction', 'startedAt']) if (dup[k] === null && e[k] !== null) dup[k] = e[k];
+    if (dup.pid === null) dup.pid = e.pid;
+    if (e.status === 'active') dup.status = 'active';
+    if (e.lastActivityAt > dup.lastActivityAt) dup.lastActivityAt = e.lastActivityAt;
+  }
+  return merged;
+}
+
+async function buildAgentsEnvelope() {
+  const now = new Date();
+  const psRows = await snapshotProcesses();
+  const agents = mergeAgentEntries([
+    ...collectClaudeAgents(path.join(HOME, '.claude', 'projects'), now),
+    ...collectKimiAgents(HOME, now),
+    ...collectCodexAgents(HOME, now),
+    ...collectClaudeFlowAgents(HOME, psRows, now),
+  ]);
+  assignInteractivePids(agents, psRows);
+  return {
+    schemaVersion: 1, ok: true, generatedAt: now.toISOString(),
+    agents: agents.map(({ _session, ...pub }) => pub),
+  };
+}
+async function cmdAgents(rest) {
+  const wantsJSON = rest.includes('--json');
+  try {
+    const flags = parseStrictFlags(rest, new Set(), new Set(['--json']));
+    if (!flags['--json']) throw aiError('invalid_arguments', 'pm agents requires --json.');
+    console.log(JSON.stringify(await buildAgentsEnvelope()));
+  } catch (err) {
+    if (wantsJSON) emitAIJSONFailure(err);
+    else { console.error(err instanceof AIProviderError ? err.message : 'pm agents: command failed'); process.exitCode = 1; }
+  }
+}
+
+// ── pm burn: token usage + spend across claude / kimi / codex, plus coding time ──
+
+const BURN_CACHE_PATH = path.join(RUNTIME_DIR, 'burn-cache-v1.json');
+const BURN_CACHE_MAX_AGE_MS = 60_000;
+
+// USD per 1M tokens, matched by model-id prefix (first match wins). Unknown models fall
+// back to the sonnet row and are reported under `unpricedModels`.
+const CLAUDE_PRICE_TABLE = [
+  ['claude-opus-4', { input: 15, output: 75, cacheWrite: 18.75, cacheRead: 1.50 }],
+  ['claude-sonnet-4', { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.30 }],
+  ['claude-3-5-sonnet', { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.30 }],
+  ['claude-3.5', { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.30 }],
+  ['claude-haiku-4', { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.10 }],
+  ['claude-3-5-haiku', { input: 1, output: 5, cacheWrite: 1.25, cacheRead: 0.10 }],
+  ['claude-3-haiku', { input: 0.25, output: 1.25, cacheWrite: 0.30, cacheRead: 0.03 }],
+];
+const CLAUDE_PRICE_FALLBACK = { input: 3, output: 15, cacheWrite: 3.75, cacheRead: 0.30 };
+function priceRowForModel(model) {
+  const m = String(model || '');
+  for (const [prefix, row] of CLAUDE_PRICE_TABLE) if (m.startsWith(prefix)) return { row, priced: true };
+  return { row: CLAUDE_PRICE_FALLBACK, priced: false };
+}
+function costForUsage(model, usage) {
+  const { row, priced } = priceRowForModel(model);
+  const costUsd = (numOr(usage?.input) * row.input + numOr(usage?.output) * row.output +
+    numOr(usage?.cacheWrite) * row.cacheWrite + numOr(usage?.cacheRead) * row.cacheRead) / 1e6;
+  return { costUsd, priced };
+}
+function numOr(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+const round6 = n => Math.round(n * 1e6) / 1e6;
+const round1 = n => Math.round(n * 10) / 10;
+
+// local-timezone calendar day key — all burn bucketing is by local day.
+function localDayKey(ms) {
+  const d = new Date(ms);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+// date keys for the last `n` local calendar days including today, oldest first.
+function dayKeysForWindow(now, n) {
+  const keys = [];
+  for (let i = n - 1; i >= 0; i--)
+    keys.push(localDayKey(new Date(now.getFullYear(), now.getMonth(), now.getDate() - i, 12).getTime()));
+  return keys;
+}
+
+function emptyTokenBucket() { return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }; }
+// bucket usage records ({ms, input, output, cacheRead, cacheWrite, cost?}) by local day.
+// today/week/month are TOTAL token counts (all four components summed) as plain ints;
+// byDay lists the 4-component breakdown for days with data inside the `days` window,
+// oldest first. (Shape frozen by mac/Sources/FoldviewMenuBar/Data/BurnPayload.swift.)
+function bucketByDay(records, now = new Date(), days = 30) {
+  const buckets = new Map(), costByDay = new Map();
+  for (const r of records) {
+    if (!r || typeof r.ms !== 'number' || Number.isNaN(r.ms)) continue;
+    const key = localDayKey(r.ms);
+    const b = buckets.get(key) || emptyTokenBucket();
+    b.input += numOr(r.input); b.output += numOr(r.output);
+    b.cacheRead += numOr(r.cacheRead); b.cacheWrite += numOr(r.cacheWrite);
+    buckets.set(key, b);
+    if (typeof r.cost === 'number') costByDay.set(key, (costByDay.get(key) || 0) + r.cost);
+  }
+  const inWindow = new Set(dayKeysForWindow(now, days));
+  const byDay = [...buckets.keys()].filter(k => inWindow.has(k)).sort()
+    .map(date => ({ date, ...buckets.get(date) }));
+  const sumKeys = keys => {
+    let total = 0;
+    for (const k of keys) {
+      const b = buckets.get(k);
+      if (b) total += b.input + b.output + b.cacheRead + b.cacheWrite;
+    }
+    return total;
+  };
+  const sumCost = keys => round6(keys.reduce((acc, k) => acc + (costByDay.get(k) || 0), 0));
+  return {
+    today: sumKeys(dayKeysForWindow(now, 1)),
+    week: sumKeys(dayKeysForWindow(now, 7)),
+    month: sumKeys(dayKeysForWindow(now, 30)),
+    costToday: sumCost(dayKeysForWindow(now, 1)),
+    costWeek: sumCost(dayKeysForWindow(now, 7)),
+    costMonth: sumCost(dayKeysForWindow(now, 30)),
+    byDay,
+  };
+}
+
+// stream a JSONL file line-by-line — transcripts can be 100+ MB, never load them whole.
+function streamJsonLines(filePath, onLine) {
+  return new Promise(resolve => {
+    let input;
+    try { input = fs.createReadStream(filePath, 'utf8'); } catch { resolve(); return; }
+    const rl = readline.createInterface({ input, crlfDelay: Infinity });
+    rl.on('line', line => { try { onLine(line); } catch {} });
+    rl.on('close', resolve);
+    input.on('error', () => { try { rl.close(); } catch {} resolve(); });
+  });
+}
+// cheap "timestamp" scrape from a raw line — avoids JSON.parse on lines we only need
+// for the coding-time union. Returns epoch ms or null.
+function rawTimestampMs(line) {
+  if (!line.includes('"timestamp"')) return null;
+  const m = /"timestamp"\s*:\s*"([^"]+)"/.exec(line);
+  if (!m) return null;
+  const t = Date.parse(m[1]);
+  return Number.isNaN(t) ? null : t;
+}
+
+// one Claude Code assistant usage line → normalized {model, ms, usage}, or null.
+function parseClaudeUsageLine(line) {
+  if (!line.includes('"usage"')) return null;
+  let rec;
+  try { rec = JSON.parse(line); } catch { return null; }
+  const usage = rec?.message?.usage, model = rec?.message?.model;
+  if (!usage || typeof usage !== 'object' || typeof model !== 'string' || !model) return null;
+  const ms = typeof rec.timestamp === 'string' ? Date.parse(rec.timestamp) : NaN;
+  return {
+    model, ms: Number.isNaN(ms) ? null : ms,
+    usage: {
+      input: numOr(usage.input_tokens), output: numOr(usage.output_tokens),
+      cacheRead: numOr(usage.cache_read_input_tokens), cacheWrite: numOr(usage.cache_creation_input_tokens),
+    },
+  };
+}
+
+async function scanClaudeUsage(homeDir, now, days) {
+  const records = [], timestamps = [], byModel = new Map(), unpriced = new Set();
+  const projectsDir = path.join(homeDir, '.claude', 'projects');
+  let slugs = [];
+  try { slugs = fs.readdirSync(projectsDir, { withFileTypes: true }); } catch {}
+  for (const d of slugs) {
+    if (!d.isDirectory()) continue;
+    const dir = path.join(projectsDir, d.name);
+    let files = [];
+    try { files = fs.readdirSync(dir); } catch { continue; }
+    for (const f of files) {
+      if (!f.endsWith('.jsonl')) continue;
+      await streamJsonLines(path.join(dir, f), line => {
+        const ts = rawTimestampMs(line);           // every record feeds the coding-time union
+        if (ts !== null) timestamps.push(ts);
+        const u = parseClaudeUsageLine(line);      // cheap substring gate inside
+        if (!u) return;
+        const { costUsd, priced } = costForUsage(u.model, u.usage);
+        const bm = byModel.get(u.model) || { ...emptyTokenBucket(), costUsd: 0 };
+        bm.input += u.usage.input; bm.output += u.usage.output;
+        bm.cacheRead += u.usage.cacheRead; bm.cacheWrite += u.usage.cacheWrite;
+        bm.costUsd += costUsd;
+        byModel.set(u.model, bm);
+        if (!priced) unpriced.add(u.model);
+        if (u.ms !== null) records.push({ ms: u.ms, ...u.usage, cost: costUsd });
+      });
+    }
+  }
+  const buckets = bucketByDay(records, now, days);
+  const byModelOut = {};
+  let totalInput = 0, totalCacheRead = 0;
+  for (const model of [...byModel.keys()].sort()) {
+    const bm = byModel.get(model);
+    byModelOut[model] = { input: bm.input, output: bm.output, cacheRead: bm.cacheRead, cacheWrite: bm.cacheWrite, costUsd: round6(bm.costUsd) };
+    totalInput += bm.input; totalCacheRead += bm.cacheRead;
+  }
+  return {
+    section: {
+      tokens: { today: buckets.today, week: buckets.week, month: buckets.month, byDay: buckets.byDay },
+      byModel: byModelOut,
+      costUsd: { today: buckets.costToday, week: buckets.costWeek, month: buckets.costMonth },
+      cacheHitPct: totalInput + totalCacheRead > 0 ? round1(100 * totalCacheRead / (totalInput + totalCacheRead)) : 0,
+      unpricedModels: [...unpriced].sort(),
+    },
+    timestamps,
+  };
+}
+
+// one Kimi Code usage.record line → normalized {ms, input, output, cacheRead, cacheWrite}, or null.
+function parseKimiUsageLine(line) {
+  if (!line.includes('"usage.record"')) return null;
+  let rec;
+  try { rec = JSON.parse(line); } catch { return null; }
+  if (rec?.type !== 'usage.record') return null;
+  const u = rec.usage && typeof rec.usage === 'object' ? rec.usage : {};
+  return {
+    ms: typeof rec.time === 'number' && Number.isFinite(rec.time) ? rec.time : null,
+    input: numOr(u.inputOther), output: numOr(u.output),
+    cacheRead: numOr(u.inputCacheRead), cacheWrite: numOr(u.inputCacheCreation),
+  };
+}
+// every ~/.kimi-code/sessions/<a>/<b>/agents/<agent>/wire.jsonl
+function* walkKimiWireFiles(homeDir) {
+  const root = path.join(homeDir, '.kimi-code', 'sessions');
+  let lvl1;
+  try { lvl1 = fs.readdirSync(root, { withFileTypes: true }); } catch { return; }
+  for (const a of lvl1) {
+    if (!a.isDirectory()) continue;
+    let lvl2;
+    try { lvl2 = fs.readdirSync(path.join(root, a.name), { withFileTypes: true }); } catch { continue; }
+    for (const b of lvl2) {
+      if (!b.isDirectory()) continue;
+      const agentsDir = path.join(root, a.name, b.name, 'agents');
+      let ags;
+      try { ags = fs.readdirSync(agentsDir, { withFileTypes: true }); } catch { continue; }
+      for (const ag of ags) {
+        if (!ag.isDirectory()) continue;
+        const p = path.join(agentsDir, ag.name, 'wire.jsonl');
+        if (fs.existsSync(p)) yield p;
+      }
+    }
+  }
+}
+
+async function scanKimiUsage(homeDir, now, days) {
+  const records = [], timestamps = [];
+  for (const file of walkKimiWireFiles(homeDir)) {
+    await streamJsonLines(file, line => {
+      if (line.includes('"time"')) {               // every timed record feeds the coding-time union
+        const m = /"time"\s*:\s*(\d{9,})/.exec(line);
+        if (m) timestamps.push(Number(m[1]));
+      }
+      const u = parseKimiUsageLine(line);
+      if (u && u.ms !== null) records.push(u);
+    });
+  }
+  const buckets = bucketByDay(records, now, days);
+  return {
+    section: {
+      tokens: { today: buckets.today, week: buckets.week, month: buckets.month, byDay: buckets.byDay },
+      note: 'subscription',
+    },
+    timestamps,
+  };
+}
+
+// one Codex event_msg token_count line → {ms, usage, rateLimits}, or null.
+function parseCodexTokenCountLine(line) {
+  if (!line.includes('"token_count"')) return null;
+  let rec;
+  try { rec = JSON.parse(line); } catch { return null; }
+  if (rec?.type !== 'event_msg' || rec?.payload?.type !== 'token_count') return null;
+  const t = rec.payload.info?.total_token_usage;
+  if (!t || typeof t !== 'object') return null;
+  const ms = typeof rec.timestamp === 'string' ? Date.parse(rec.timestamp) : NaN;
+  return {
+    ms: Number.isNaN(ms) ? null : ms,
+    rateLimits: rec.payload.rate_limits && typeof rec.payload.rate_limits === 'object' ? rec.payload.rate_limits : null,
+    usage: {
+      input: numOr(t.input_tokens), output: numOr(t.output_tokens),
+      cached: numOr(t.cached_input_tokens), total: numOr(t.total_tokens),
+    },
+  };
+}
+function codexQuotaFromRateLimits(rl) {
+  if (!rl || typeof rl !== 'object') return null;
+  const first = (...vals) => vals.find(v => v && typeof v === 'object') || {};
+  const primary = first(rl.primary_rate_limit, rl.primary, rl);
+  const rawResets = numOr(primary.resets_at ?? primary.resetsAt);
+  let resetsAt = null;
+  if (rawResets > 0) {
+    const ms = rawResets < 1e12 ? rawResets * 1000 : rawResets;   // epoch seconds or ms
+    resetsAt = new Date(ms).toISOString();
+  }
+  const credits = rl.credits && typeof rl.credits === 'object' ? rl.credits : {};
+  return {
+    usedPercent: numOr(primary.used_percent ?? primary.usedPercent),
+    windowMinutes: numOr(primary.window_minutes ?? primary.windowMinutes),
+    resetsAt,
+    creditBalance: credits.balance != null && Number.isFinite(Number(credits.balance)) ? Number(credits.balance) : null,
+    planType: typeof rl.plan_type === 'string' ? rl.plan_type : (typeof rl.planType === 'string' ? rl.planType : null),
+  };
+}
+
+async function scanCodexUsage(homeDir) {
+  const totals = { input: 0, output: 0, cached: 0, total: 0 };
+  const timestamps = [];
+  let newest = null;                               // newest token_count record overall (for rate limits)
+  for (const file of walkCodexRollouts(homeDir)) {
+    let last = null;                               // codex usage is cumulative — latest per rollout wins
+    await streamJsonLines(file, line => {
+      const ts = rawTimestampMs(line);
+      if (ts !== null) timestamps.push(ts);
+      const u = parseCodexTokenCountLine(line);
+      if (u) last = u;
+    });
+    if (!last) continue;
+    totals.input += last.usage.input; totals.output += last.usage.output;
+    totals.cached += last.usage.cached; totals.total += last.usage.total;
+    if (!newest || (last.ms !== null && (newest.ms === null || last.ms > newest.ms))) newest = last;
+  }
+  return { section: { tokens: { total: totals }, quota: codexQuotaFromRateLimits(newest?.rateLimits) }, timestamps };
+}
+
+// coding time: per local day, sort unique event timestamps; each event counts >= 30s,
+// and gaps of <= 5 min to the next event count in full. Sessions break on longer gaps.
+function codingMinutesByDay(timestamps) {
+  const groups = new Map();
+  for (const ms of timestamps) {
+    if (typeof ms !== 'number' || !Number.isFinite(ms)) continue;
+    const key = localDayKey(ms);
+    if (!groups.has(key)) groups.set(key, new Set());
+    groups.get(key).add(ms);
+  }
+  // Wall-clock segments: merge events separated by ≤5 min gaps into one span, then
+  // credit a small tail per segment for work after the last event. Per-event floors
+  // would let dense agent days exceed 24h, which reads as nonsense in the UI.
+  const GAP = 5 * 60_000;
+  const TAIL = 2 * 60_000;
+  const out = new Map();
+  for (const [key, set] of groups) {
+    const sorted = [...set].sort((a, b) => a - b);
+    let totalMs = 0;
+    let segStart = null;
+    let segEnd = null;
+    for (const t of sorted) {
+      if (segStart === null) { segStart = t; segEnd = t; continue; }
+      if (t - segEnd <= GAP) { segEnd = t; continue; }
+      totalMs += (segEnd - segStart) + TAIL;
+      segStart = t;
+      segEnd = t;
+    }
+    if (segStart !== null) totalMs += (segEnd - segStart) + TAIL;
+    out.set(key, Math.min(totalMs / 60_000, 24 * 60));
+  }
+  return out;
+}
+// coding minutes per local day as INTEGERS (the BurnPayload.swift CodingTime contract):
+// each day's raw minutes are rounded, and the rollups sum the rounded day values so the
+// envelope is internally consistent.
+function buildCodingTimeSection(timestamps, now, days) {
+  const byDayMap = codingMinutesByDay(timestamps);
+  const rounded = new Map([...byDayMap].map(([k, v]) => [k, Math.round(v)]));
+  const inWindow = new Set(dayKeysForWindow(now, days));
+  const byDay = [...rounded.keys()].filter(k => inWindow.has(k)).sort()
+    .map(date => ({ date, minutes: rounded.get(date) }));
+  const sumKeys = keys => keys.reduce((acc, k) => acc + (rounded.get(k) || 0), 0);
+  let total = 0;
+  for (const v of rounded.values()) total += v;
+  return {
+    todayMin: sumKeys(dayKeysForWindow(now, 1)),
+    weekMin: sumKeys(dayKeysForWindow(now, 7)),
+    monthMin: sumKeys(dayKeysForWindow(now, 30)),
+    totalMin: total,
+    byDay,
+  };
+}
+
+// one `gh api graphql` call for the last `days` of commit contributions. Any failure
+// (gh missing, not logged in, network) is reported as a typed section error upstream.
+function fetchGithubContributions(now, days = 30) {
+  const from = new Date(now.getTime() - days * 86_400_000).toISOString();
+  const query = 'query { viewer { login contributionsCollection(from:"' + from + '",to:"' + now.toISOString() + '") { ' +
+    'totalCommitContributions commitContributionsByRepository(maxRepositories:25) { repository { nameWithOwner } contributions { totalCount } } } } }';
+  return new Promise((resolve, reject) => {
+    execFile('gh', ['api', 'graphql', '-f', `query=${query}`], { timeout: 10_000, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) { reject(new Error(stderr?.trim() || err.message)); return; }
+        try {
+          const viewer = JSON.parse(stdout)?.data?.viewer;
+          if (!viewer || typeof viewer !== 'object') throw new Error('unexpected gh response');
+          const cc = viewer.contributionsCollection || {};
+          resolve({
+            login: typeof viewer.login === 'string' ? viewer.login : null,
+            commits30d: numOr(cc.totalCommitContributions),
+            byRepo: (Array.isArray(cc.commitContributionsByRepository) ? cc.commitContributionsByRepository : [])
+              .map(r => ({ repo: r?.repository?.nameWithOwner || '', commits: numOr(r?.contributions?.totalCount) })),
+          });
+        } catch (e) { reject(e); }
+      });
+  });
+}
+
+function burnErrorSection(code, err) {
+  return { error: { code, message: sanitizeAIText(String(err && err.message || err), 200) } };
+}
+async function buildBurnEnvelope(homeDir, now = new Date(), days = 30) {
+  const sections = {};
+  const timestamps = [];
+  let sources = 0;
+  const scans = [
+    ['claude', () => scanClaudeUsage(homeDir, now, days)],
+    ['kimi', () => scanKimiUsage(homeDir, now, days)],
+    ['codex', () => scanCodexUsage(homeDir)],
+  ];
+  for (const [name, scan] of scans) {
+    try {
+      const { section, timestamps: ts } = await scan();
+      sections[name] = section;
+      timestamps.push(...ts);
+      sources++;
+    } catch (err) { sections[name] = burnErrorSection(`${name}-scan-failed`, err); }
+  }
+  sections.codingTime = sources > 0
+    ? buildCodingTimeSection(timestamps, now, days)
+    : burnErrorSection('no-sources', 'All usage sources failed.');
+  try { sections.github = await fetchGithubContributions(now, days); }
+  catch (err) { sections.github = burnErrorSection('gh-unavailable', err); }
+  const anyOk = ['claude', 'kimi', 'codex', 'codingTime', 'github'].some(k => !sections[k]?.error);
+  return { schemaVersion: 1, ok: anyOk, generatedAt: now.toISOString(), days, ...sections };
+}
+async function cmdBurn(rest) {
+  const wantsJSON = rest.includes('--json');
+  try {
+    const flags = parseStrictFlags(rest, new Set(['--days']), new Set(['--json', '--refresh']));
+    if (!flags['--json']) throw aiError('invalid_arguments', 'pm burn requires --json.');
+    let days = 30;
+    if (flags['--days'] !== undefined) {
+      if (!/^\d+$/.test(flags['--days'])) throw aiError('invalid_arguments', 'pm burn: --days must be a positive integer.');
+      days = Number(flags['--days']);
+      if (days < 1 || days > 365) throw aiError('invalid_arguments', 'pm burn: --days must be between 1 and 365.');
+    }
+    if (!flags['--refresh']) {                   // fresh cache (< 60s) wins over recomputing
+      try {
+        if (Date.now() - fs.statSync(BURN_CACHE_PATH).mtimeMs < BURN_CACHE_MAX_AGE_MS) {
+          console.log(fs.readFileSync(BURN_CACHE_PATH, 'utf8'));
+          return;
+        }
+      } catch {}
+    }
+    const envelope = await buildBurnEnvelope(HOME, new Date(), days);
+    const text = JSON.stringify(envelope);
+    try {                                        // atomic cache write: tmp file + rename
+      fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+      const tmp = BURN_CACHE_PATH + '.tmp-' + process.pid + '-' + Math.random().toString(36).slice(2);
+      fs.writeFileSync(tmp, text);
+      fs.renameSync(tmp, BURN_CACHE_PATH);
+    } catch {}
+    console.log(text);
+  } catch (err) {
+    if (wantsJSON) emitAIJSONFailure(err);
+    else { console.error(err instanceof AIProviderError ? err.message : 'pm burn: command failed'); process.exitCode = 1; }
+  }
+}
+
+// ── pm hook-bridge: stdin shim called by Claude Code / Kimi Code hooks ──
+// Fail-open by design: a hook shim must NEVER break the user's tool call, so every
+// failure path (bad stdin, missing bridge, refused connection, timeout) exits 0 silently.
+
+const NOTCH_BRIDGE_PATH = path.join(RUNTIME_DIR, 'notch-bridge-v1.json');
+const HOOK_BRIDGE_EVENT_TIMEOUT_MS = 5_000;
+const HOOK_BRIDGE_APPROVE_TIMEOUT_MS = 250_000;
+
+function readStdinText() {
+  return new Promise(resolve => {
+    if (process.stdin.isTTY) { resolve(''); return; }
+    let data = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', chunk => {
+      data += chunk;
+      if (data.length > AI_MAX_INPUT_BYTES) { try { process.stdin.destroy(); } catch {} resolve(data); }
+    });
+    process.stdin.on('end', () => resolve(data));
+    process.stdin.on('error', () => resolve(data));
+  });
+}
+// POST the hook payload to the running notch bridge. Returns 0 always; prints the bridge's
+// response verbatim ONLY for claude PreToolUse when it is valid JSON carrying
+// hookSpecificOutput (the contract Claude Code reads back from a permission hook).
+async function runHookBridge({ cli, event, stdin, stdout, statePath = NOTCH_BRIDGE_PATH, fetchImpl = globalThis.fetch }) {
+  const out = stdout || process.stdout;
+  try {
+    if (cli !== 'claude' && cli !== 'kimi') return 0;
+    if (typeof event !== 'string' || !event || typeof fetchImpl !== 'function') return 0;
+    const raw = stdin === undefined || stdin === null ? await readStdinText() : String(stdin);
+    let payload;
+    try { payload = JSON.parse(raw); } catch { return 0; }
+    const state = readJSON(statePath);
+    const port = Number(state?.port);
+    const token = typeof state?.token === 'string' ? state.token : '';
+    if (!Number.isInteger(port) || port < 1 || port > 65535 || !token) return 0;
+    const isApprove = cli === 'claude' && event === 'PreToolUse';
+    let res;
+    try {
+      res = await fetchImpl(`http://127.0.0.1:${port}${isApprove ? '/approve' : '/event'}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${token}` },
+        body: JSON.stringify({ cli, event, payload }),
+        signal: AbortSignal.timeout(isApprove ? HOOK_BRIDGE_APPROVE_TIMEOUT_MS : HOOK_BRIDGE_EVENT_TIMEOUT_MS),
+      });
+    } catch { return 0; }                        // refused / timeout / aborted — silent
+    if (!isApprove) { try { await res.arrayBuffer(); } catch {} return 0; }   // drain + ignore
+    if (res.status !== 200) { try { await res.arrayBuffer(); } catch {} return 0; }
+    let text;
+    try { text = await res.text(); } catch { return 0; }
+    let parsed;
+    try { parsed = JSON.parse(text); } catch { return 0; }
+    if (parsed && typeof parsed === 'object' && 'hookSpecificOutput' in parsed) out.write(text);
+    return 0;
+  } catch { return 0; }
+}
+function cmdHookBridge(rest) {
+  return runHookBridge({ cli: rest[0], event: rest[1] });
+}
+
+// ── pm hooks: install / uninstall / status for the two CLI hook configs ──
+
+const CLAUDE_HOOK_EVENTS = [
+  { event: 'PreToolUse', timeout: 300, matcher: '' },
+  { event: 'SessionStart', timeout: 10 },
+  { event: 'SessionEnd', timeout: 10 },
+  { event: 'Stop', timeout: 10 },
+  { event: 'SubagentStart', timeout: 10 },
+  { event: 'SubagentStop', timeout: 10 },
+  { event: 'Notification', timeout: 10 },
+];
+const KIMI_HOOK_EVENTS = [
+  { event: 'PreToolUse', timeout: 300, matcher: '' },
+  { event: 'PermissionRequest', timeout: 10 },
+  { event: 'PermissionResult', timeout: 10 },
+  { event: 'SessionStart', timeout: 10 },
+  { event: 'SessionEnd', timeout: 10 },
+  { event: 'SubagentStart', timeout: 10 },
+  { event: 'SubagentStop', timeout: 10 },
+];
+const HOOK_MARKER = '# foldview-notch-hook';
+
+// absolute path of the running pm/folder.mjs — hooks spawn `node <this> hook-bridge …`,
+// so PATH doesn't matter inside the hook. Falls back to this module's own file when
+// argv[1] isn't us (e.g. imported under node --test).
+function pmScriptPath() {
+  const fromArgv = process.argv[1] ? path.resolve(process.argv[1]) : null;
+  if (fromArgv) {
+    try { if (fs.realpathSync(fromArgv) === fs.realpathSync(SELF_FILE)) return fromArgv; } catch {}
+  }
+  return SELF_FILE;
+}
+function hookBridgeCommand(absPm, cli, event) {
+  const pm = /\s/.test(absPm) ? `"${absPm}"` : absPm;
+  return `node ${pm} hook-bridge ${cli} ${event}`;
+}
+
+// add our entries to a parsed Claude settings object (idempotent, existing hooks preserved).
+// Returns the events added this run.
+function installClaudeHookEntries(settings, absPm) {
+  if (!settings.hooks || typeof settings.hooks !== 'object' || Array.isArray(settings.hooks)) settings.hooks = {};
+  const added = [];
+  for (const { event, timeout, matcher } of CLAUDE_HOOK_EVENTS) {
+    const command = hookBridgeCommand(absPm, 'claude', event);
+    const list = Array.isArray(settings.hooks[event]) ? settings.hooks[event] : (settings.hooks[event] = []);
+    const exists = list.some(entry => Array.isArray(entry?.hooks) &&
+      entry.hooks.some(h => h?.command === command));
+    if (exists) continue;
+    const entry = {};
+    if (matcher !== undefined) entry.matcher = matcher;
+    entry.hooks = [{ type: 'command', command, timeout }];
+    list.push(entry);
+    added.push(event);
+  }
+  return added;
+}
+// remove exactly our entries (matched by `hook-bridge` in the command string), keeping
+// any other hooks on the same event entry. Returns the events we removed something from.
+function uninstallClaudeHookEntries(settings) {
+  const removed = [];
+  const hooks = settings?.hooks;
+  if (!hooks || typeof hooks !== 'object') return removed;
+  for (const event of Object.keys(hooks)) {
+    const list = hooks[event];
+    if (!Array.isArray(list)) continue;
+    const kept = [];
+    for (const entry of list) {
+      if (Array.isArray(entry?.hooks)) {
+        entry.hooks = entry.hooks.filter(h => !(typeof h?.command === 'string' && h.command.includes('hook-bridge')));
+        if (entry.hooks.length === 0) { removed.push(event); continue; }
+      }
+      kept.push(entry);
+    }
+    if (kept.length) hooks[event] = kept;
+    else if (list.length) delete hooks[event];
+  }
+  return removed;
+}
+// events (of ours) currently present in a parsed Claude settings object.
+function claudeHookEventsInstalled(settings) {
+  const events = [];
+  const hooks = settings?.hooks;
+  if (!hooks || typeof hooks !== 'object') return events;
+  for (const { event } of CLAUDE_HOOK_EVENTS) {
+    const list = hooks[event];
+    if (Array.isArray(list) && list.some(entry => Array.isArray(entry?.hooks) &&
+      entry.hooks.some(h => typeof h?.command === 'string' && h.command.includes(`hook-bridge claude ${event}`))))
+      events.push(event);
+  }
+  return events;
+}
+
+function kimiHookBlock(absPm, { event, timeout, matcher }) {
+  const lines = [HOOK_MARKER, '[[hooks]]', `event = "${event}"`];
+  if (matcher !== undefined) lines.push(`matcher = "${matcher}"`);
+  lines.push(`command = "${hookBridgeCommand(absPm, 'kimi', event).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`,
+    `timeout = ${timeout}`);
+  return lines.join('\n');
+}
+// events already installed inside marked foldview blocks (line-based, no TOML parse).
+function kimiHookEventsPresent(tomlText) {
+  const events = [];
+  let marked = false;
+  for (const line of String(tomlText).split('\n')) {
+    if (line.trim() === HOOK_MARKER) { marked = true; continue; }
+    if (marked) {
+      const m = line.match(/^\s*event\s*=\s*"([^"]+)"/);
+      if (m) { events.push(m[1]); marked = false; }
+    }
+  }
+  return events;
+}
+// append marked [[hooks]] blocks for any missing event; everything else stays byte-identical.
+function installKimiHookBlocks(tomlText, absPm) {
+  let out = String(tomlText);
+  const added = [];
+  for (const spec of KIMI_HOOK_EVENTS) {
+    if (kimiHookEventsPresent(out).includes(spec.event)) continue;
+    if (out.length && !out.endsWith('\n')) out += '\n';
+    out += '\n' + kimiHookBlock(absPm, spec) + '\n';
+    added.push(spec.event);
+  }
+  return { text: out, added };
+}
+// remove each marked block: the marker comment line plus the contiguous non-blank lines
+// of its [[hooks]] table, and the single blank separator line install put before the
+// marker. Unmarked content is never touched or reordered (uninstall after install is a
+// byte-identical restore).
+function uninstallKimiHookBlocks(tomlText) {
+  const lines = String(tomlText).split('\n');
+  const kept = [], removed = [];
+  let i = 0;
+  while (i < lines.length) {
+    if (lines[i].trim() === HOOK_MARKER) {
+      if (kept.length && kept[kept.length - 1].trim() === '' &&
+          (kept.length < 2 || kept[kept.length - 2].trim() !== ''))
+        kept.pop();
+      let j = i + 1;
+      while (j < lines.length && lines[j].trim() !== '') {
+        const m = lines[j].match(/^\s*event\s*=\s*"([^"]+)"/);
+        if (m) removed.push(m[1]);
+        j++;
+      }
+      i = j;                                   // skip marker + its block lines
+      continue;
+    }
+    kept.push(lines[i]);
+    i++;
+  }
+  return { text: kept.join('\n'), removed };
+}
+
+// one-time backup next to the original, created before our first mutation only.
+function backupOnce(filePath) {
+  try {
+    const bak = filePath + '.foldview-bak';
+    if (!fs.existsSync(bak) && fs.existsSync(filePath)) fs.copyFileSync(filePath, bak);
+  } catch {}
+}
+function bridgeStatus() {
+  const st = readJSON(NOTCH_BRIDGE_PATH);
+  const pid = Number(st?.pid);
+  if (st && Number.isInteger(pid) && pid > 0 && isPidAlive(pid)) {
+    const out = { running: true };
+    if (Number.isInteger(Number(st.port))) out.port = Number(st.port);
+    return out;
+  }
+  return { running: false };
+}
+function hooksStatus() {
+  const claudeEvents = claudeHookEventsInstalled(readJSON(path.join(HOME, '.claude', 'settings.json')));
+  const kimiEvents = kimiHookEventsPresent(
+    fs.existsSync(path.join(HOME, '.kimi-code', 'config.toml'))
+      ? fs.readFileSync(path.join(HOME, '.kimi-code', 'config.toml'), 'utf8') : '');
+  return {
+    schemaVersion: 1, ok: true,
+    claude: { installed: claudeEvents.length === CLAUDE_HOOK_EVENTS.length, events: claudeEvents },
+    kimi: { installed: kimiEvents.length === KIMI_HOOK_EVENTS.length, events: kimiEvents },
+    bridge: bridgeStatus(),
+  };
+}
+function cmdHooks(rest) {
+  const sub = rest[0];
+  if (sub !== 'install' && sub !== 'uninstall' && sub !== 'status') {
+    console.error('pm hooks: expected install, uninstall, or status');
+    process.exitCode = 1;
+    return;
+  }
+  if (sub === 'status') { console.log(JSON.stringify(hooksStatus())); return; }
+  const absPm = pmScriptPath();
+  const claudePath = path.join(HOME, '.claude', 'settings.json');
+  const kimiPath = path.join(HOME, '.kimi-code', 'config.toml');
+
+  // Claude: JSON parse failure ⇒ typed failure, file left untouched.
+  let settings = {};
+  const claudeExisted = fs.existsSync(claudePath);
+  if (claudeExisted) {
+    const raw = fs.readFileSync(claudePath, 'utf8');
+    if (raw.trim()) {
+      try { settings = JSON.parse(raw); } catch {
+        emitAIJSONFailure(aiError('config_read_failed',
+          'Claude settings.json could not be parsed; leaving it untouched.'));
+        return;
+      }
+      if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+        emitAIJSONFailure(aiError('config_read_failed',
+          'Claude settings.json is not a JSON object; leaving it untouched.'));
+        return;
+      }
+    }
+  }
+  if (sub === 'install') {
+    backupOnce(claudePath);
+    installClaudeHookEntries(settings, absPm);
+    fs.mkdirSync(path.dirname(claudePath), { recursive: true });
+    fs.writeFileSync(claudePath, JSON.stringify(settings, null, 2) + '\n');
+  } else if (claudeExisted) {
+    uninstallClaudeHookEntries(settings);
+    fs.writeFileSync(claudePath, JSON.stringify(settings, null, 2) + '\n');
+  }
+
+  // Kimi: line-based TOML mutation; unmarked content is preserved verbatim.
+  const kimiExisted = fs.existsSync(kimiPath);
+  const kimiText = kimiExisted ? fs.readFileSync(kimiPath, 'utf8') : '';
+  let kimiOut = kimiText;
+  if (sub === 'install') {
+    backupOnce(kimiPath);
+    kimiOut = installKimiHookBlocks(kimiText, absPm).text;
+    fs.mkdirSync(path.dirname(kimiPath), { recursive: true });
+    fs.writeFileSync(kimiPath, kimiOut);
+  } else if (kimiExisted) {
+    kimiOut = uninstallKimiHookBlocks(kimiText).text;
+    if (kimiOut !== kimiText) fs.writeFileSync(kimiPath, kimiOut);
+  }
+  console.log(JSON.stringify(hooksStatus()));
+}
+
+const SUBCOMMANDS = new Set(['status', 'roots', 'action', 'ai', 'config', 'aiclis', 'menubar', 'serve', 'agents', 'burn', 'hook-bridge', 'hooks']);
 function dispatchSubcommand(cmd, rest) {
   switch (cmd) {
     case 'status': return cmdStatus(rest);
     case 'roots': return cmdRoots(rest);
     case 'action': return cmdAction(rest);
+    case 'ai': return cmdAI(rest);
+    case 'config': return cmdConfig(rest);
+    case 'aiclis': return cmdAIClis(rest);
     case 'menubar': return cmdMenubar(rest);
     case 'serve': return cmdServe(rest);
+    case 'agents': return cmdAgents(rest);
+    case 'burn': return cmdBurn(rest);
+    case 'hook-bridge': return cmdHookBridge(rest);
+    case 'hooks': return cmdHooks(rest);
   }
 }
 
 // ────────────────────────────── main ──────────────────────────────────
+// When launched with no explicit path, prefer ~/Documents (the user's real project home) over
+// the current working directory — so `foldview` from anywhere lists the same, focused set of
+// projects instead of sweeping whatever folder you happen to be standing in. An explicit path
+// argument still wins. Falls back to cwd if ~/Documents doesn't exist.
+function defaultRoot() {
+  const docs = path.join(HOME, 'Documents');
+  try { if (fs.statSync(docs).isDirectory()) return docs; } catch {}
+  return process.cwd();
+}
+
 function main() {
   const argv = process.argv.slice(2);
   if (SUBCOMMANDS.has(argv[0])) {
@@ -2189,7 +4780,7 @@ function main() {
 
   const flags = new Set(argv.filter(a => a.startsWith('-')));
   const pathArg = argv.find(a => !a.startsWith('-'));
-  const root = path.resolve(pathArg || process.cwd());
+  const root = path.resolve(pathArg || defaultRoot());
 
   if (flags.has('-h') || flags.has('--help')) return printHelp();
   if (!fs.existsSync(root)) { console.error(`pm: path not found: ${root}`); process.exit(1); }
@@ -2204,25 +4795,46 @@ if (!process.env.PM_NO_MAIN) main();
 
 export {
   liveServerFor, readLogPort, frameworkPort, portCwd, pathInside, state, buildProjectList, scanPorts, loadExtraApps,
+  parseLsofListeners,
   detectApps, parseAppInput, mergeDiscovered, readConfig, addUserApp, removeUserApp,
   // config
   writeConfig, updateConfig, ensureConfigDefaults, CONFIG_PATH,
   // AI terminals
   KNOWN_AI_CLIS, resolveExecutable, assignFreeKey, discoverAIClis, resolveCustomCli, saveCustomCli,
-  computeGrid, getMainDisplayBounds, buildAITerminalsScript, spawnAITerminals, launchAITerminals,
-  shq, asq,
+  AIProviderError, classifyAIProvider, executableFile, providerConfigPath, parseCodexCatalogPayload, parseTomlSubset,
+  parseKimiCatalogSource, readAIProviderDefaults, writeAIProviderDefaults, loadCodexCatalog,
+  loadKimiCatalog, buildAIProviderCatalog, validateAISelection, availableProviderCatalog,
+  prepareAIValidatedLaunch, buildAIProviderLaunch,
+  computeGrid, getMainDisplayBounds, buildAITerminalsScript, buildAITerminalCommand,
+  spawnAITerminals, launchAITerminals, shq, asq, quoteEnv,
   // GitHub push
   DEFAULT_GITIGNORE, sanitizeRepoName, repoNameFor, webUrlFromRemote, planPush, footerGh,
   // managed runtime registry
   RUNTIME_PATH, loadRuntimeRegistry, writeRuntimeRegistry, recordRuntimeEntry, removeRuntimeEntry,
   isPidAlive, pidCommandMatches, pidCwd, validateOwnership, findOwnedRegistryEntry, realpathSafe,
   // CLI bridge
-  parseFlagValue, lightProjectInfo, buildMenubarStatus, cmdStatus, cmdRoots, cmdAction, cmdMenubar,
+  parseFlagValue, parseStrictFlags, lightProjectInfo, buildMenubarStatus, cmdStatus, cmdRoots, cmdAI, cmdConfig, cmdAIClis, cmdAction, cmdMenubar,
+  inspectMenubarInstallation, installedMenubarVersion, menubarIsRunning, writeCLIPathRecord, MENUBAR_APP_PATH, CLI_PATH_RECORD,
   dispatchSubcommand, actionOpen, actionStart, actionStop, actionEditor, actionAi,
   // static site serving
   staticSiteDir, cmdServe, startStaticServer, isSelfProject,
+  // telemetry: agents / burn / hook bridge / hook config
+  readFileTailLines, parseTranscriptTail, parseKimiWireTail, parseCodexRolloutTail,
+  collectClaudeAgents, collectKimiAgents, collectCodexAgents, collectClaudeFlowAgents,
+  parsePsTable, snapshotProcesses, mergeAgentEntries, assignInteractivePids,
+  buildAgentsEnvelope, cmdAgents,
+  parseClaudeUsageLine, parseKimiUsageLine, parseCodexTokenCountLine, costForUsage, priceRowForModel,
+  bucketByDay, codingMinutesByDay, localDayKey, dayKeysForWindow, buildCodingTimeSection,
+  codexQuotaFromRateLimits, fetchGithubContributions, buildBurnEnvelope, cmdBurn, CLAUDE_PRICE_TABLE,
+  runHookBridge, cmdHookBridge, NOTCH_BRIDGE_PATH,
+  cmdHooks, hooksStatus, bridgeStatus, pmScriptPath, hookBridgeCommand,
+  installClaudeHookEntries, uninstallClaudeHookEntries, claudeHookEventsInstalled,
+  installKimiHookBlocks, uninstallKimiHookBlocks, kimiHookEventsPresent,
+  CLAUDE_HOOK_EVENTS, KIMI_HOOK_EVENTS,
   // footer helper (for rendering assertions)
-  footerAi, footer, keyhints, stripAnsi, onKey, computeStats, scanProjects,
+  footerAi, footer, keyhints, stripAnsi, resetAIEffort, initialAIEffort, moveAIChoice,
+  backAIPhase, submitAILaunch,
+  onKey, computeStats, scanProjects,
   // sub-features / drill-in navigation
   detectRoutes, detectNestedProjects, subFeaturesOf, isDescendable, serverPathOf,
   enterProject, goBack, hasFeatures,

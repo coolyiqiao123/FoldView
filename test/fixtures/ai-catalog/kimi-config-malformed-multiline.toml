@@ -1,0 +1,14 @@
+default_model = "fixture-model"
+
+[models."fixture-model"]
+model = "fixture-remote-model"
+display_name = "Fixture Model"
+capabilities = ["thinking"]
+support_efforts = [
+  "low",
+  "high",
+]
+
+[metadata]
+description = """This otherwise valid TOML is outside Foldview's accepted
+line-preserving subset."""

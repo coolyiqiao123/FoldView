@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-19T00:00:00.000Z",
+  "providers": [
+    {
+      "id": "codex",
+      "name": "Codex",
+      "executable": "/opt/foldview-test/bin/codex",
+      "available": false,
+      "error": {
+        "code": "malformed_catalog",
+        "message": "Codex returned a model catalog Foldview could not read.",
+        "provider": "codex",
+        "retryable": true
+      },
+      "defaultModel": null,
+      "defaultEffort": null,
+      "models": []
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi Code",
+      "executable": "/opt/foldview-test/bin/kimi",
+      "available": true,
+      "error": null,
+      "defaultModel": "moonshot/k3",
+      "defaultEffort": "high",
+      "models": [
+        {
+          "id": "moonshot/k3",
+          "label": "Kimi # Preview",
+          "detail": "Kimi managed model",
+          "efforts": ["low", "medium", "high"],
+          "defaultEffort": "medium"
+        },
+        {
+          "id": "moonshot/k2.5",
+          "label": "Kimi Fixed Thinker",
+          "detail": "Thinking is always on",
+          "efforts": [],
+          "defaultEffort": null
+        }
+      ]
+    }
+  ]
+}
+

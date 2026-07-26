@@ -65,6 +65,20 @@ test('spawnAITerminals: never runs a different executable — an unresolvable CL
   } finally { restore(); }
 });
 
+test('spawnAITerminals: rejects an executable directory before spawning osascript', async () => {
+  const bin = tmpDir('foldview-bin-');
+  const marker = path.join(bin, 'RAN');
+  makeBin(bin, 'osascript', `#!/bin/sh\necho ran > ${marker}\nexit 0\n`);
+  const cliDirectory = path.join(bin, 'looks-like-a-cli'); fs.mkdirSync(cliDirectory);
+  fs.chmodSync(cliDirectory, 0o700);
+  const restore = withPath([bin]);
+  try {
+    const r = await spawnAITerminals(fakeProject(), { name: 'Directory', executable: cliDirectory }, 1);
+    assert.equal(r.ok, false); assert.match(r.message, /could not resolve/);
+    assert.equal(fs.existsSync(marker), false);
+  } finally { restore(); }
+});
+
 test('spawnAITerminals: an entry with no real local directory fails with a status message, no spawn', async () => {
   const bin = tmpDir('foldview-bin-');
   const marker = path.join(bin, 'RAN');

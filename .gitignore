@@ -1,6 +1,13 @@
 # local tooling / agents
 .claude-flow/
 .claude/
+.cursor/
+AGENTS.md
+CLAUDE.md
+PROJECT-CONTEXT.md
+
+# local site snapshot taken before the redesign (kept out of history)
+.site-pre-asme-backup-2026-07-20/
 
 # dependencies
 node_modules/

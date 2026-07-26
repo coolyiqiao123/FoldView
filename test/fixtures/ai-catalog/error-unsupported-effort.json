@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "error": {
+    "code": "unsupported_effort",
+    "message": "Effort extreme is not supported by codex-deep.",
+    "provider": "codex",
+    "model": "codex-deep",
+    "effort": "extreme",
+    "retryable": false
+  }
+}

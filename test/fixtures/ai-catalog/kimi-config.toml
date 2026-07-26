@@ -1,0 +1,27 @@
+# Kimi fixture: comments and unknown settings must survive targeted writes.
+default_model = "moonshot/k3"
+telemetry = false
+
+[models."moonshot/k3"]
+model = "kimi-k3-test"
+display_name = "Kimi # Preview" # this hash starts a real comment
+capabilities = ["thinking", "tool_use"]
+support_efforts = ["low", "medium", "high"]
+default_effort = "medium"
+provider = "fixture-provider"
+
+[models."moonshot/k2.5"]
+model = "kimi-k2.5-test"
+display_name = "Kimi Fixed Thinker"
+capabilities = ["thinking"]
+# No support_efforts: thinking is fixed, not selectable.
+
+[thinking]
+enabled = true
+effort = "high"
+
+[providers.fixture-provider]
+type = "fixture"
+endpoint = "https://example.invalid/api#fragment"
+unknown_setting = "preserve me"
+

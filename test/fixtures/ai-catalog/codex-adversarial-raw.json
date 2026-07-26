@@ -1,0 +1,36 @@
+{
+  "models": [
+    {
+      "slug": "safe-model",
+      "display_name": "Safe\u202eModel",
+      "description": "Line\u0007Break",
+      "visibility": "list",
+      "priority": 10,
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [
+        { "effort": "high" },
+        { "effort": "high" },
+        { "effort": "bad effort" }
+      ]
+    },
+    {
+      "slug": "safe-model",
+      "display_name": "Duplicate must be ignored",
+      "description": "Later duplicate",
+      "visibility": "list",
+      "priority": 1,
+      "supported_reasoning_levels": [
+        { "effort": "low" }
+      ]
+    },
+    {
+      "slug": "evil\u2066id",
+      "display_name": "Rejected format-control ID",
+      "description": "This entry must be omitted",
+      "visibility": "list",
+      "priority": 2,
+      "supported_reasoning_levels": []
+    }
+  ]
+}
+

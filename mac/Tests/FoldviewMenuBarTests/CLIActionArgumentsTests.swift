@@ -34,8 +34,25 @@ struct CLIActionArgumentsTests {
 
     @Test func aiArguments() {
         #expect(
-            CLIAction.ai(project: "/p", cli: "/usr/local/bin/claude", count: 3).arguments ==
-            ["action", "ai", "--project", "/p", "--cli", "/usr/local/bin/claude", "--count", "3"]
+            CLIAction.ai(
+                project: "/p", cli: "/usr/local/bin/claude", count: 3,
+                provider: nil, model: nil, effort: nil
+            ).arguments ==
+            ["action", "ai", "--project", "/p", "--cli", "/usr/local/bin/claude", "--count", "3", "--json"]
+        )
+    }
+
+    @Test func aiModelControlArgumentsAreSeparateLiteralTokens() {
+        let model = "model '$(touch /tmp/no)'\nnext"
+        let effort = "high\"; echo nope"
+        #expect(
+            CLIAction.ai(
+                project: "/a project", cli: "/opt/bin/codex", count: 2,
+                provider: "codex", model: model, effort: effort
+            ).arguments == [
+                "action", "ai", "--project", "/a project", "--cli", "/opt/bin/codex", "--count", "2",
+                "--provider", "codex", "--model", model, "--effort", effort, "--json"
+            ]
         )
     }
 
@@ -49,8 +66,11 @@ struct CLIActionArgumentsTests {
 
     @Test func dangerousCLIPathStaysAsOneUntouchedArgvElement() {
         let dangerousCLI = "/usr/local/bin/claude\" ; touch /tmp/pwned #"
-        let args = CLIAction.ai(project: "/p", cli: dangerousCLI, count: 9).arguments
-        #expect(args == ["action", "ai", "--project", "/p", "--cli", dangerousCLI, "--count", "9"])
+        let args = CLIAction.ai(
+            project: "/p", cli: dangerousCLI, count: 9,
+            provider: nil, model: nil, effort: nil
+        ).arguments
+        #expect(args == ["action", "ai", "--project", "/p", "--cli", dangerousCLI, "--count", "9", "--json"])
     }
 
     // MARK: - Quoting helpers used only for the native "Open Foldview" launch.

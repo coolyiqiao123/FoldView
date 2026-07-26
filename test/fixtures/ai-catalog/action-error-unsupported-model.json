@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "ok": false,
+  "error": {
+    "code": "unsupported_model",
+    "message": "Model removed-model is not available for Codex.",
+    "provider": "codex",
+    "model": "removed-model",
+    "retryable": false
+  }
+}
+

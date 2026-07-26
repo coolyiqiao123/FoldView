@@ -1,0 +1,9 @@
+{
+  "name": "foldview-site",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Foldview marketing site — static, zero build step",
+  "scripts": {
+    "dev": "node server.js"
+  }
+}
