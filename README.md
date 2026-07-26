@@ -35,18 +35,17 @@ stay on your machine — nothing is uploaded or sent over the network.
  ↑↓ move · ↵ launch site · d start · x stop · a AI terminals · o localhost · e editor · / find · q quit
 ```
 
-## What's next
+## To Do
 
-I want to move Foldview's most glanceable information into the macOS notch,
-so you can keep an eye on agents without leaving what you're doing:
+None of the below is built yet. I want to move Foldview's most glanceable
+information into the macOS notch, so you can keep an eye on agents without
+leaving what you're doing:
 
-- Check agent performance and status from the notch.
-- Read and send email there, instead of switching apps and losing your place.
-- When an agent takes control of the screen, mirror its view into the notch
-  rather than taking over your display.
-
-The first piece of this already ships as **Notch Nook** in the optional
-[menu-bar companion](#macos-menu-bar-companion-optional).
+- [ ] Check agent performance and status from the notch.
+- [ ] Read and send email there, instead of switching apps and losing your
+      place.
+- [ ] When an agent takes control of the screen, mirror its view into the
+      notch rather than taking over your display.
 
 ## Quick start
 
