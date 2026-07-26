@@ -2,18 +2,18 @@
 
 **Your projects and AI coding tools, ready in one terminal.**
 
-Foldview is a friendly terminal home for projects, local apps, and AI coding
+Foldview is a terminal home for your projects, local apps, and AI coding
 agents — a zero-dependency terminal workspace and launchpad for vibe coding.
 Open it and see, in one screen, what projects you have, what's already
-running, and the fastest way into the next AI coding session.
+running, and the fastest way into your next AI coding session.
 
-Foldview is not another coding agent. It's the calm control surface around
-the agents and projects you already have.
+I built Foldview because typing the same commands into a terminal over and
+over got in the way of actually working.
 
 **Local-first.** Foldview scans folders on your machine, detects the AI CLIs
-and editors already installed, and reads/writes its own config at
-`~/.foldview.json`. Project discovery, CLI detection, and configuration stay
-on your machine — nothing is uploaded or sent over the network.
+and editors already installed, and reads and writes its own config at
+`~/.foldview.json`. Project discovery, CLI detection, and configuration all
+stay on your machine — nothing is uploaded or sent over the network.
 
 ```
   foldview 🚀  ·  11 projects   ~/Documents                  ● 3000 5173
@@ -34,6 +34,19 @@ on your machine — nothing is uploaded or sent over the network.
 └──────────────────────────────┴─────────────────────────────────────┘
  ↑↓ move · ↵ launch site · d start · x stop · a AI terminals · o localhost · e editor · / find · q quit
 ```
+
+## What's next
+
+I want to move Foldview's most glanceable information into the macOS notch,
+so you can keep an eye on agents without leaving what you're doing:
+
+- Check agent performance and status from the notch.
+- Read and send email there, instead of switching apps and losing your place.
+- When an agent takes control of the screen, mirror its view into the notch
+  rather than taking over your display.
+
+The first piece of this already ships as **Notch Nook** in the optional
+[menu-bar companion](#macos-menu-bar-companion-optional).
 
 ## Quick start
 
